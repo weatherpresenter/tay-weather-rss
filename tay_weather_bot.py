@@ -9,6 +9,18 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
+INCLUDE_SPECIAL_WEATHER_STATEMENTS = True
+INCLUDE_ALERTS = True  # warnings/watches/advisories etc.
+
+EXCLUDED_EVENTS = {
+    "test",
+    "alert ready test",
+    "broadcast intrusion",
+}
+
+# Cooldowns (recommended)
+COOLDOWN_MINUTES_ALERTS = 45
+COOLDOWN_MINUTES_SWS = 120
 
 # ----------------------------
 # Settings (Tay hamlets)
@@ -23,15 +35,13 @@ AREA_KEYWORDS = [
 ]
 
 OFFICES = ["CWTO"]  # Ontario Storm Prediction Centre
-HOURS_BACK_TO_SCAN = 6           # look back a few hours to avoid missing items
-MAX_RSS_ITEMS = 25               # keep RSS tidy
+HOURS_BACK_TO_SCAN = 6  # look back a few hours to avoid missing items
+MAX_RSS_ITEMS = 25  # keep RSS tidy
 STATE_PATH = "state.json"
 RSS_PATH = "tay-weather.xml"
 USER_AGENT = "tay-weather-rss-bot/1.0"
 
-
-# Optional: include a stable public “more info” link in descriptions
-# You can change this later if you prefer a different landing page.
+# Optional: include a stable “more info” link in descriptions
 MORE_INFO_URL = "https://weather.gc.ca/warnings/index_e.html?prov=on"
 
 
@@ -51,27 +61,43 @@ def normalize(s: str) -> str:
 def load_state() -> dict:
     """
     Load state.json safely.
-    If the file is missing, empty, or invalid JSON,
-    reset to a clean default instead of crashing.
+    If missing/invalid, reset to defaults.
     """
+    default = {"seen_ids": [], "cooldowns": {}}
+
     if not os.path.exists(STATE_PATH):
-        return {"seen_ids": []}
+        return default
 
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict) and "seen_ids" in data:
-                return data
+            if not isinstance(data, dict):
+                return default
+            if "seen_ids" not in data or not isinstance(data["seen_ids"], list):
+                data["seen_ids"] = []
+            if "cooldowns" not in data or not isinstance(data["cooldowns"], dict):
+                data["cooldowns"] = {}
+            return data
     except Exception:
-        pass
-
-    # Fallback: reset corrupted state
-    return {"seen_ids": []}
+        return default
 
 
 def save_state(state: dict) -> None:
     # Prevent endless growth
     state["seen_ids"] = state.get("seen_ids", [])[-5000:]
+
+    # Keep cooldowns from growing forever: retain only last 7 days
+    cooldowns = state.get("cooldowns", {})
+    if isinstance(cooldowns, dict) and cooldowns:
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        seven_days = 7 * 24 * 60 * 60
+        state["cooldowns"] = {
+            k: v for k, v in cooldowns.items()
+            if isinstance(v, (int, float)) and (now - float(v)) <= seven_days
+        }
+    else:
+        state["cooldowns"] = {}
+
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
@@ -160,8 +186,26 @@ def parse_cap(xml_text: str) -> dict:
     }
 
 
-def is_special_weather_statement(cap: dict) -> bool:
-    return normalize(cap.get("event", "")) == "special weather statement"
+def should_include_event(cap: dict) -> bool:
+    event = normalize(cap.get("event", ""))
+
+    if not event:
+        return False
+
+    # Skip tests
+    if any(bad in event for bad in EXCLUDED_EVENTS):
+        return False
+
+    is_sws = (event == "special weather statement")
+
+    if is_sws and INCLUDE_SPECIAL_WEATHER_STATEMENTS:
+        return True
+
+    # “Alerts” = everything else (warnings/watches/advisories etc.)
+    if (not is_sws) and INCLUDE_ALERTS:
+        return True
+
+    return False
 
 
 def area_matches(cap: dict) -> bool:
@@ -196,6 +240,46 @@ def rfc2822_date_from_sent(sent: str) -> str:
     return email.utils.format_datetime(dt.datetime.now(dt.timezone.utc))
 
 
+def parse_sent_to_epoch(sent: str) -> float:
+    """
+    Convert CAP 'sent' to epoch seconds (UTC). Best-effort.
+    """
+    if sent:
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                if fmt.endswith("%z"):
+                    d = dt.datetime.strptime(sent, fmt)
+                    return d.timestamp()
+                else:
+                    d = dt.datetime.strptime(sent, fmt).replace(tzinfo=dt.timezone.utc)
+                    return d.timestamp()
+            except Exception:
+                pass
+    return dt.datetime.now(dt.timezone.utc).timestamp()
+
+
+def cooldown_key(cap: dict) -> str:
+    """
+    Key by event + primary area. Prevents spam on bulletin updates.
+    """
+    event = normalize(cap.get("event", ""))
+    areas = cap.get("areas", []) or []
+    primary_area = normalize(areas[0]) if areas else ""
+    if not primary_area:
+        primary_area = "tay-area"
+    return f"{event}|{primary_area}"
+
+
+def cooldown_minutes_for(cap: dict) -> int:
+    """
+    Use different cooldowns for SWS vs alerts.
+    """
+    event = normalize(cap.get("event", ""))
+    if event == "special weather statement":
+        return COOLDOWN_MINUTES_SWS
+    return COOLDOWN_MINUTES_ALERTS
+
+
 def ensure_rss_exists() -> None:
     if os.path.exists(RSS_PATH):
         return
@@ -206,8 +290,8 @@ def ensure_rss_exists() -> None:
     ET.SubElement(channel, "title").text = "Tay Township Weather Statements"
     ET.SubElement(channel, "link").text = "https://weatherpresenter.github.io/tay-weather-rss/"
     ET.SubElement(channel, "description").text = (
-        "Automated Special Weather Statements for Victoria Harbour, Port McNicoll, "
-        "Waubaushene, and Waverley."
+        "Automated Weather Canada alerts and Special Weather Statements for Victoria Harbour, "
+        "Port McNicoll, Waubaushene, and Waverley."
     )
     ET.SubElement(channel, "language").text = "en-ca"
 
@@ -233,7 +317,14 @@ def rss_item_exists(channel: ET.Element, guid_text: str) -> bool:
     return False
 
 
-def add_rss_item(channel: ET.Element, title: str, link: str, guid: str, pub_date: str, description: str) -> None:
+def add_rss_item(
+    channel: ET.Element,
+    title: str,
+    link: str,
+    guid: str,
+    pub_date: str,
+    description: str,
+) -> None:
     # Insert item near top (after channel metadata)
     item = ET.Element("item")
     ET.SubElement(item, "title").text = title
@@ -287,6 +378,10 @@ def main():
     state = load_state()
     seen = set(state.get("seen_ids", []))
 
+    cooldowns = state.get("cooldowns", {})
+    if not isinstance(cooldowns, dict):
+        cooldowns = {}
+
     tree, channel = load_rss_tree()
 
     new_items = 0
@@ -302,7 +397,9 @@ def main():
 
             for cap_url in cap_urls:
                 try:
-                    xml_text = requests.get(cap_url, headers={"User-Agent": USER_AGENT}, timeout=20).text
+                    xml_text = requests.get(
+                        cap_url, headers={"User-Agent": USER_AGENT}, timeout=20
+                    ).text
                     cap = parse_cap(xml_text)
                 except Exception:
                     continue
@@ -314,22 +411,41 @@ def main():
                 # Mark as seen even if it doesn't match, so we don't keep reprocessing it
                 seen.add(cap_id)
 
-                if not is_special_weather_statement(cap):
+                if not should_include_event(cap):
                     continue
 
                 if not area_matches(cap):
                     continue
 
+                # Cooldown check (avoid repeated posts for same event+area)
+                key = cooldown_key(cap)
+                now_ts = parse_sent_to_epoch(cap.get("sent", ""))
+                last_ts = cooldowns.get(key)
+
+                cooldown_mins = cooldown_minutes_for(cap)
+                if isinstance(last_ts, (int, float)):
+                    minutes_since = (now_ts - float(last_ts)) / 60.0
+                    if minutes_since < cooldown_mins:
+                        continue
+
                 # Build RSS fields
-                title = cap.get("headline") or "Special Weather Statement"
+                title = cap.get("headline") or cap.get("event") or "Weather update"
                 pub_date = rfc2822_date_from_sent(cap.get("sent", ""))
                 guid = cap_id
                 link = cap_url  # link directly to the CAP file (public)
                 description = build_description(cap)
 
                 if not rss_item_exists(channel, guid):
-                    add_rss_item(channel, title=title, link=link, guid=guid, pub_date=pub_date, description=description)
+                    add_rss_item(
+                        channel,
+                        title=title,
+                        link=link,
+                        guid=guid,
+                        pub_date=pub_date,
+                        description=description,
+                    )
                     new_items += 1
+                    cooldowns[key] = now_ts
 
     # Update lastBuildDate for neatness
     now_rfc = email.utils.format_datetime(dt.datetime.now(dt.timezone.utc))
@@ -343,6 +459,7 @@ def main():
     # Save RSS + state
     tree.write(RSS_PATH, encoding="utf-8", xml_declaration=True)
     state["seen_ids"] = list(seen)
+    state["cooldowns"] = cooldowns
     save_state(state)
 
     print(f"Done. Added {new_items} new RSS item(s).")
