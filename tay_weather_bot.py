@@ -4,14 +4,22 @@ import re
 import datetime as dt
 import email.utils
 import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 from requests_oauthlib import OAuth1
 
+# ---------------------------------
+# Behaviour switches
+# ---------------------------------
 INCLUDE_SPECIAL_WEATHER_STATEMENTS = True
-INCLUDE_ALERTS = True  # warnings/watches/advisories etc.
+INCLUDE_ALERTS = True  # warnings/watches/advisories etc. (and Cancel/Update messages)
+
+# If True, only match on CAP areaDesc (recommended to avoid unrelated alerts).
+# Note: this means your AREA_KEYWORDS must match Environment Canada region names,
+# not just hamlet names.
+STRICT_AREA_MATCH = True
 
 EXCLUDED_EVENTS = {
     "test",
@@ -19,72 +27,60 @@ EXCLUDED_EVENTS = {
     "broadcast intrusion",
 }
 
-# Kill switch (set ENABLE_X_POSTING="false" in workflow env to stop posting)
-ENABLE_X_POSTING = os.environ.get("ENABLE_X_POSTING", "true").lower() == "true"
-
-# X Free tier safety
-MAX_TWEETS_PER_DAY = 15
-
-# Severity cooldowns (recommended)
-COOLDOWN_MINUTES_WARNING = 60
-COOLDOWN_MINUTES_WATCH = 90
-COOLDOWN_MINUTES_ADVISORY = 120
-COOLDOWN_MINUTES_SWS = 180
-COOLDOWN_MINUTES_CANCEL = 15  # allow quick all clear without repeats
-
-# ----------------------------
-# Settings (Tay hamlets)
-# ----------------------------
+# ---------------------------------
+# Settings (Tay hamlets + common region name)
+# ---------------------------------
 AREA_KEYWORDS = [
+    # These hamlets often do NOT appear in CAP areaDesc, so keep these only if you set STRICT_AREA_MATCH = False.
     "Victoria Harbour",
     "Port McNicoll",
     "Waubaushene",
     "Waverley",
-    # Common alert region name that often covers Tay-area communities:
+    # This is closer to how EC regions are named and is more likely to match areaDesc
     "Midland - Coldwater - Orr Lake",
 ]
 
 OFFICES = ["CWTO"]  # Ontario Storm Prediction Centre
-HOURS_BACK_TO_SCAN = 6
-MAX_RSS_ITEMS = 25
+HOURS_BACK_TO_SCAN = 6           # look back to avoid missing items
+MAX_RSS_ITEMS = 25               # keep RSS tidy
 STATE_PATH = "state.json"
 RSS_PATH = "tay-weather.xml"
 USER_AGENT = "tay-weather-rss-bot/1.0"
 
 MORE_INFO_URL = "https://weather.gc.ca/warnings/index_e.html?prov=on"
 
+# ---------------------------------
+# X (Twitter) posting
+# ---------------------------------
+POST_TO_X = True  # Set False if you want RSS-only
 
-# ----------------------------
-# Tweet templates
-# ----------------------------
-X_TEMPLATE_ALERT = (
-    "⚠️ Weather Canada {event}\n"
-    "Area: {area}\n"
-    "{headline}\n"
-    "Details: {url}\n"
-    "{tags}"
-)
+# Put these in GitHub repo secrets:
+# X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET
+X_API_KEY = os.getenv("X_API_KEY", "")
+X_API_SECRET = os.getenv("X_API_SECRET", "")
+X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN", "")
+X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET", "")
 
-X_TEMPLATE_SWS = (
-    "Weather Canada Special Weather Statement\n"
-    "Area: {area}\n"
-    "{headline}\n"
-    "Details: {url}\n"
-    "{tags}"
-)
+# Optional: force a test tweet from Actions by setting TEST_TWEET="true" in workflow env
+TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
 
-X_TEMPLATE_ALL_CLEAR = (
-    "✅ Weather update: All clear\n"
-    "Area: {area}\n"
-    "Previous: {event}\n"
-    "Details: {url}\n"
-    "{tags}"
-)
+# ---------------------------------
+# Cooldowns (recommended defaults)
+# ---------------------------------
+# Cooldowns prevent repeated posts for the same region and event.
+# Use more aggressive cooldowns for lower-severity items.
+COOLDOWN_SECONDS_BY_CLASS = {
+    "warning": 30 * 60,   # 30 minutes
+    "watch": 60 * 60,     # 60 minutes
+    "advisory": 90 * 60,  # 90 minutes
+    "sws": 3 * 60 * 60,   # 3 hours for Special Weather Statement
+    "other": 2 * 60 * 60, # 2 hours
+    "cancel": 0,          # no cooldown for cancellations (all-clear)
+}
 
-
-# ----------------------------
+# ---------------------------------
 # Helpers
-# ----------------------------
+# ---------------------------------
 def normalize(s: str) -> str:
     if not s:
         return ""
@@ -94,16 +90,29 @@ def normalize(s: str) -> str:
     return s
 
 
-def load_state() -> dict:
-    default = {
-        "seen_ids": [],
-        "cooldowns": {},
-        "posted_guids": [],
-        "daily_counts": {},
-        "posted_tweets": {},
-        "active_alerts": {},
-    }
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
+
+def iso_now() -> str:
+    return now_utc().isoformat()
+
+
+def parse_iso(s: str) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def load_state() -> dict:
+    """
+    Load state.json safely.
+    If the file is missing, empty, or invalid JSON, reset to defaults.
+    """
+    default = {"seen_ids": [], "cooldowns": {}}
     if not os.path.exists(STATE_PATH):
         return default
 
@@ -112,11 +121,8 @@ def load_state() -> dict:
             data = json.load(f)
             if not isinstance(data, dict):
                 return default
-
-            for k, v in default.items():
-                if k not in data or not isinstance(data[k], type(v)):
-                    data[k] = v
-
+            data.setdefault("seen_ids", [])
+            data.setdefault("cooldowns", {})
             return data
     except Exception:
         return default
@@ -124,43 +130,12 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     state["seen_ids"] = state.get("seen_ids", [])[-5000:]
-    state["posted_guids"] = state.get("posted_guids", [])[-5000:]
-
-    # Trim posted_tweets to avoid unbounded growth
-    posted_tweets = state.get("posted_tweets", {})
-    if isinstance(posted_tweets, dict) and len(posted_tweets) > 5000:
-        # Keep latest 5000 by insertion order (Python 3.7+ preserves insertion order)
-        items = list(posted_tweets.items())[-5000:]
-        state["posted_tweets"] = dict(items)
-
-    # Keep cooldowns from growing forever (retain last 7 days)
-    cooldowns = state.get("cooldowns", {})
-    if isinstance(cooldowns, dict) and cooldowns:
-        now = dt.datetime.now(dt.timezone.utc).timestamp()
-        seven_days = 7 * 24 * 60 * 60
-        state["cooldowns"] = {
-            k: v
-            for k, v in cooldowns.items()
-            if isinstance(v, (int, float)) and (now - float(v)) <= seven_days
-        }
-    else:
-        state["cooldowns"] = {}
-
-    # Keep daily_counts tidy (retain last 30 days)
-    daily_counts = state.get("daily_counts", {})
-    if isinstance(daily_counts, dict) and daily_counts:
-        today = dt.datetime.now(dt.timezone.utc)
-        keep = {}
-        for k, v in daily_counts.items():
-            try:
-                d = dt.datetime.strptime(k, "%Y%m%d").replace(tzinfo=dt.timezone.utc)
-                if (today - d).days <= 30:
-                    keep[k] = int(v)
-            except Exception:
-                continue
-        state["daily_counts"] = keep
-    else:
-        state["daily_counts"] = {}
+    # keep cooldowns from growing endlessly
+    if isinstance(state.get("cooldowns"), dict) and len(state["cooldowns"]) > 5000:
+        # keep most recent 5000 by timestamp if possible
+        items = list(state["cooldowns"].items())
+        items.sort(key=lambda kv: (kv[1] or ""), reverse=True)
+        state["cooldowns"] = dict(items[:5000])
 
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -210,18 +185,16 @@ def parse_cap(xml_text: str) -> dict:
     identifier = find_text(root, "identifier")
     sent = find_text(root, "sent")
 
-    # CAP root-level fields
-    msg_type = find_text(root, "msgType")  # Alert, Update, Cancel, etc.
-    status = find_text(root, "status")     # Actual, Test
-
     info = pick_info_block(root)
     event = find_text(info, "event")
     headline = find_text(info, "headline")
     description = find_text(info, "description")
     instruction = find_text(info, "instruction")
+
+    msg_type = find_text(info, "msgType")  # Alert, Update, Cancel (common in EC CAP)
     severity = find_text(info, "severity")
-    certainty = find_text(info, "certainty")
     urgency = find_text(info, "urgency")
+    certainty = find_text(info, "certainty")
 
     areas = []
     if info is not None:
@@ -233,54 +206,63 @@ def parse_cap(xml_text: str) -> dict:
     return {
         "identifier": identifier,
         "sent": sent,
-        "msgType": msg_type,
-        "status": status,
         "event": event,
         "headline": headline,
         "description": description,
         "instruction": instruction,
-        "severity": severity,
-        "certainty": certainty,
-        "urgency": urgency,
         "areas": areas,
+        "msg_type": msg_type,
+        "severity": severity,
+        "urgency": urgency,
+        "certainty": certainty,
     }
 
 
 def should_include_event(cap: dict) -> bool:
     event = normalize(cap.get("event", ""))
-    if not event:
+    headline = normalize(cap.get("headline", ""))
+
+    if not event and not headline:
         return False
 
     # Skip tests
-    if any(bad in event for bad in EXCLUDED_EVENTS):
+    if any(bad in event for bad in EXCLUDED_EVENTS) or any(bad in headline for bad in EXCLUDED_EVENTS):
         return False
 
-    # Skip test status at CAP root level
-    if normalize(cap.get("status", "")) == "test":
-        return False
+    is_sws = (event == "special weather statement")
 
-    is_sws_event = (event == "special weather statement")
-
-    if is_sws_event and INCLUDE_SPECIAL_WEATHER_STATEMENTS:
+    if is_sws and INCLUDE_SPECIAL_WEATHER_STATEMENTS:
         return True
 
-    if (not is_sws_event) and INCLUDE_ALERTS:
+    # “Alerts” = everything else (warnings/watches/advisories etc.), including Cancel/Update
+    if (not is_sws) and INCLUDE_ALERTS:
         return True
 
     return False
 
 
 def area_matches(cap: dict) -> bool:
-    # Only match on areaDesc (official regions), not description/headline
-    areas = [normalize(a) for a in cap.get("areas", []) if a]
-    if not areas:
+    """
+    Recommended: match only on CAP areaDesc to avoid pulling unrelated alerts.
+    If STRICT_AREA_MATCH is False, we also fall back to headline/description text.
+    """
+    areas_norm = [normalize(a) for a in cap.get("areas", []) if a]
+    hay = " | ".join(areas_norm)
+
+    fallback = ""
+    if not STRICT_AREA_MATCH:
+        fallback = normalize((cap.get("headline") or "") + " " + (cap.get("description") or ""))
+
+    if not areas_norm and STRICT_AREA_MATCH:
         return False
 
     for kw in AREA_KEYWORDS:
         nkw = normalize(kw)
         if not nkw:
             continue
-        if any(nkw in a for a in areas):
+        if nkw in hay:
+            return True
+        if fallback and nkw in fallback:
             return True
 
     return False
@@ -297,56 +279,7 @@ def rfc2822_date_from_sent(sent: str) -> str:
                 return email.utils.format_datetime(d)
             except Exception:
                 pass
-    return email.utils.format_datetime(dt.datetime.now(dt.timezone.utc))
-
-
-def parse_sent_to_epoch(sent: str) -> float:
-    if sent:
-        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                if fmt.endswith("%z"):
-                    d = dt.datetime.strptime(sent, fmt)
-                    return d.timestamp()
-                else:
-                    d = dt.datetime.strptime(sent, fmt).replace(tzinfo=dt.timezone.utc)
-                    return d.timestamp()
-            except Exception:
-                pass
-    return dt.datetime.now(dt.timezone.utc).timestamp()
-
-
-def is_sws(cap: dict) -> bool:
-    return normalize(cap.get("event", "")) == "special weather statement"
-
-
-def is_cancel(cap: dict) -> bool:
-    return normalize(cap.get("msgType", "")) == "cancel"
-
-
-def cooldown_key(cap: dict) -> str:
-    # event + primary area (stable enough for spam prevention)
-    event = normalize(cap.get("event", ""))
-    areas = cap.get("areas", []) or []
-    primary_area = normalize(areas[0]) if areas else "tay-area"
-    return f"{event}|{primary_area}"
-
-
-def cooldown_minutes_for(cap: dict) -> int:
-    if is_cancel(cap):
-        return COOLDOWN_MINUTES_CANCEL
-    if is_sws(cap):
-        return COOLDOWN_MINUTES_SWS
-
-    ev = normalize(cap.get("event", ""))
-    if "warning" in ev:
-        return COOLDOWN_MINUTES_WARNING
-    if "watch" in ev:
-        return COOLDOWN_MINUTES_WATCH
-    if "advisory" in ev:
-        return COOLDOWN_MINUTES_ADVISORY
-
-    # default if it does not match known buckets
-    return COOLDOWN_MINUTES_ADVISORY
+    return email.utils.format_datetime(now_utc())
 
 
 def ensure_rss_exists() -> None:
@@ -356,11 +289,10 @@ def ensure_rss_exists() -> None:
     rss = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")
 
-    ET.SubElement(channel, "title").text = "Tay Township Weather Alerts"
+    ET.SubElement(channel, "title").text = "Tay Township Weather Statements"
     ET.SubElement(channel, "link").text = "https://weatherpresenter.github.io/tay-weather-rss/"
     ET.SubElement(channel, "description").text = (
-        "Automated Weather Canada alerts and Special Weather Statements for Victoria Harbour, "
-        "Port McNicoll, Waubaushene, and Waverley."
+        "Automated weather statements and alerts for Tay-area communities."
     )
     ET.SubElement(channel, "language").text = "en-ca"
 
@@ -413,12 +345,14 @@ def trim_rss_items(channel: ET.Element, max_items: int) -> None:
 
 def build_description(cap: dict) -> str:
     bits = []
+
     areas = cap.get("areas", [])
     if areas:
         bits.append(f"Area: {areas[0]}")
 
-    if cap.get("event"):
-        bits.append(f"Event: {cap['event'].strip()}")
+    ev = cap.get("event")
+    if ev:
+        bits.append(f"Event: {ev.strip()}")
 
     if cap.get("headline"):
         bits.append(cap["headline"].strip())
@@ -437,135 +371,150 @@ def build_description(cap: dict) -> str:
     return text
 
 
-# ----------------------------
-# X helpers
-# ----------------------------
-def x_trim(text: str, limit: int = 280) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+# ---------------------------------
+# X (Twitter) helpers
+# ---------------------------------
+def x_oauth1() -> OAuth1:
+    return OAuth1(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
 
 
-def hashtag_pack(cap: dict) -> str:
+def x_enabled() -> bool:
+    if not POST_TO_X:
+        return False
+    needed = [X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET]
+    return all(v.strip() for v in needed)
+
+
+def x_post(text: str) -> None:
     """
-    Add minimal, relevant tags. Keep it conservative for municipal comms.
-    Always include #ONwx and a local tag.
+    Posts a tweet (X API v2). Raises on failure so the workflow goes red.
     """
-    base = ["#ONwx", "#TayTownship"]
-
-    hay = normalize(" ".join([
-        cap.get("event", "") or "",
-        cap.get("headline", "") or "",
-        cap.get("description", "") or "",
-    ]))
-
-    extra = []
-    if any(k in hay for k in ["thunderstorm", "tornado"]):
-        extra.append("#Storm")
-    elif any(k in hay for k in ["winter", "snow", "blizzard", "squall", "ice", "freezing rain"]):
-        extra.append("#Winter")
-    elif any(k in hay for k in ["rainfall", "flood", "flooding"]):
-        extra.append("#Flood")
-    elif "heat" in hay:
-        extra.append("#Heat")
-    elif any(k in hay for k in ["cold", "wind chill"]):
-        extra.append("#Cold")
-    elif any(k in hay for k in ["fog", "visibility"]):
-        extra.append("#Fog")
-    elif "wind" in hay:
-        extra.append("#Wind")
-
-    tags = base + extra
-    # Keep it short
-    return " ".join(tags[:4])
+    url = "https://api.twitter.com/2/tweets"
+    r = requests.post(url, auth=x_oauth1(), json={"text": text}, timeout=30)
+    print("X POST /2/tweets:", r.status_code, r.text[:500])
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"X post failed: {r.status_code} {r.text}")
 
 
-def format_x_post(cap: dict, url: str) -> str:
-    event = (cap.get("event") or "").strip() or "Weather update"
-    headline = (cap.get("headline") or "").strip()
+def classify_alert(cap: dict) -> str:
+    """
+    Return a rough class for cooldown decisions.
+    """
+    event = normalize(cap.get("event", ""))
+    headline = normalize(cap.get("headline", ""))
+    msg_type = normalize(cap.get("msg_type", ""))
+
+    if msg_type == "cancel":
+        return "cancel"
+    if event == "special weather statement":
+        return "sws"
+
+    text = f"{event} {headline}"
+    if "warning" in text:
+        return "warning"
+    if "watch" in text:
+        return "watch"
+    if "advisory" in text:
+        return "advisory"
+    return "other"
+
+
+def cooldown_key(cap: dict) -> str:
+    """
+    Cooldown per region + event class, so you do not spam updates.
+    """
+    area = (cap.get("areas") or [""])[0]
+    cls = classify_alert(cap)
+    # include msg_type so Cancel is not blocked by an Alert cooldown
+    msg_type = (cap.get("msg_type") or "").strip().lower() or "alert"
+    return f"{normalize(area)}|{cls}|{msg_type}"
+
+
+def cooldown_seconds_for(cap: dict) -> int:
+    cls = classify_alert(cap)
+    return int(COOLDOWN_SECONDS_BY_CLASS.get(cls, COOLDOWN_SECONDS_BY_CLASS["other"]))
+
+
+def is_in_cooldown(state: dict, cap: dict) -> bool:
+    cd = state.get("cooldowns", {}) or {}
+    key = cooldown_key(cap)
+    last = parse_iso(cd.get(key, ""))
+    if last is None:
+        return False
+    seconds = (now_utc() - last).total_seconds()
+    return seconds < cooldown_seconds_for(cap)
+
+
+def mark_cooldown(state: dict, cap: dict) -> None:
+    state.setdefault("cooldowns", {})
+    state["cooldowns"][cooldown_key(cap)] = iso_now()
+
+
+def shorten(s: str, limit: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)].rstrip() + "…"
+
+
+def extract_primary_area(cap: dict) -> str:
     areas = cap.get("areas") or []
-    area = areas[0].strip() if areas else "Tay area"
-    tags = hashtag_pack(cap)
-
-    if is_cancel(cap):
-        # All clear uses the event stored from active_alerts, but this is a fallback
-        text = X_TEMPLATE_ALL_CLEAR.format(area=area, event=event, url=url, tags=tags)
-    elif is_sws(cap):
-        text = X_TEMPLATE_SWS.format(area=area, headline=headline, url=url, tags=tags)
-    else:
-        text = X_TEMPLATE_ALERT.format(event=event, area=area, headline=headline, url=url, tags=tags)
-
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return x_trim(text, 280)
+    return areas[0].strip() if areas else "Tay Township area"
 
 
-def post_to_x(text: str) -> str:
-    api_key = os.environ.get("X_API_KEY", "")
-    api_secret = os.environ.get("X_API_SECRET", "")
-    access_token = os.environ.get("X_ACCESS_TOKEN", "")
-    access_secret = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
+def tweet_text_for(cap: dict) -> str:
+    """
+    Tweet templates:
+    - Alert/Update: headline + area + short action line + link
+    - Cancel: All clear follow-up
+    """
+    msg_type = normalize(cap.get("msg_type", "")) or "alert"
+    headline = cap.get("headline") or cap.get("event") or "Weather update"
+    area = extract_primary_area(cap)
+    link = MORE_INFO_URL  # stable link
 
-    if not all([api_key, api_secret, access_token, access_secret]):
-        raise RuntimeError("Missing X credentials in environment variables.")
+    # If you prefer to link the CAP file, swap this:
+    # link = cap.get("cap_url") or MORE_INFO_URL
 
-    auth = OAuth1(api_key, api_secret, access_token, access_secret)
+    if msg_type == "cancel":
+        # all clear template
+        return (
+            f"All clear: {shorten(headline, 140)}\n"
+            f"Area: {shorten(area, 120)}\n"
+            f"Continue to monitor official updates: {link}"
+        )
 
-    r = requests.post(
-        "https://api.x.com/2/tweets",
-        auth=auth,
-        json={"text": text},
-        timeout=20,
+    # Alert or Update
+    prefix = "Weather alert" if msg_type == "alert" else "Weather update"
+    return (
+        f"{prefix}: {shorten(headline, 160)}\n"
+        f"Area: {shorten(area, 120)}\n"
+        f"Details: {link}"
     )
-    r.raise_for_status()
-    data = r.json()
-    return data.get("data", {}).get("id", "")
 
 
-def today_key_utc() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
-
-
-def can_tweet_today(state: dict) -> bool:
-    daily = state.get("daily_counts", {})
-    if not isinstance(daily, dict):
-        daily = {}
-        state["daily_counts"] = daily
-
-    k = today_key_utc()
-    count = int(daily.get(k, 0))
-    return count < MAX_TWEETS_PER_DAY
-
-
-def increment_tweet_today(state: dict) -> None:
-    daily = state.get("daily_counts", {})
-    if not isinstance(daily, dict):
-        daily = {}
-        state["daily_counts"] = daily
-
-    k = today_key_utc()
-    daily[k] = int(daily.get(k, 0)) + 1
-
-
+# ---------------------------------
+# Main
+# ---------------------------------
 def main():
+    # Optional test tweet path
+    if TEST_TWEET:
+        print("TEST_TWEET is true")
+        if not x_enabled():
+            raise RuntimeError("TEST_TWEET requested but X credentials are missing in environment.")
+        x_post("Test tweet from Tay weather bot ✅")
+        print("Test tweet sent.")
+        return
+
     state = load_state()
     seen = set(state.get("seen_ids", []))
-    cooldowns = state.get("cooldowns", {})
-    posted_guids = set(state.get("posted_guids", []))
-    posted_tweets = state.get("posted_tweets", {})
-    active_alerts = state.get("active_alerts", {})
-
-    if not isinstance(cooldowns, dict):
-        cooldowns = {}
-    if not isinstance(posted_tweets, dict):
-        posted_tweets = {}
-    if not isinstance(active_alerts, dict):
-        active_alerts = {}
 
     tree, channel = load_rss_tree()
 
-    new_items = 0
-    new_tweets = 0
+    new_rss_items = 0
+    tweets_attempted = 0
+    tweets_sent = 0
+    tweets_skipped_cooldown = 0
 
     for yyyymmdd, hh in utc_dirs_to_check(HOURS_BACK_TO_SCAN):
         for office in OFFICES:
@@ -573,21 +522,27 @@ def main():
 
             try:
                 cap_urls = list_cap_files(directory_url)
-            except Exception:
+            except Exception as e:
+                print("Directory fetch failed:", directory_url, str(e))
                 continue
 
             for cap_url in cap_urls:
                 try:
                     xml_text = requests.get(cap_url, headers={"User-Agent": USER_AGENT}, timeout=20).text
                     cap = parse_cap(xml_text)
-                except Exception:
+                    cap["cap_url"] = cap_url
+                except Exception as e:
+                    print("CAP parse failed:", cap_url, str(e))
                     continue
 
-                cap_id = cap.get("identifier", "").strip()
-                if not cap_id or cap_id in seen:
+                cap_id = (cap.get("identifier") or "").strip()
+                if not cap_id:
                     continue
 
-                # Mark seen so we do not keep reprocessing
+                if cap_id in seen:
+                    continue
+
+                # Mark as seen so we do not reprocess forever
                 seen.add(cap_id)
 
                 if not should_include_event(cap):
@@ -595,107 +550,38 @@ def main():
                 if not area_matches(cap):
                     continue
 
-                key = cooldown_key(cap)
-                now_ts = parse_sent_to_epoch(cap.get("sent", ""))
-                last_ts = cooldowns.get(key)
-                cooldown_mins = cooldown_minutes_for(cap)
-
-                if isinstance(last_ts, (int, float)):
-                    minutes_since = (now_ts - float(last_ts)) / 60.0
-                    if minutes_since < cooldown_mins:
-                        continue
-
-                # Build RSS item (include cancels too for audit trail)
+                # RSS fields
                 title = cap.get("headline") or cap.get("event") or "Weather update"
                 pub_date = rfc2822_date_from_sent(cap.get("sent", ""))
                 guid = cap_id
-                link = cap_url
+                link = cap_url  # CAP link for RSS
                 description = build_description(cap)
 
                 if not rss_item_exists(channel, guid):
                     add_rss_item(channel, title=title, link=link, guid=guid, pub_date=pub_date, description=description)
-                    new_items += 1
-                    cooldowns[key] = now_ts
+                    new_rss_items += 1
 
-                # Decide whether to tweet
-                if not ENABLE_X_POSTING:
-                    continue
+                # Tweeting logic: tweet only for newly seen CAP items that match Tay filter
+                if x_enabled():
+                    tweets_attempted += 1
 
-                if guid in posted_guids:
-                    continue
-
-                if not can_tweet_today(state):
-                    continue
-
-                # All clear logic:
-                # If this CAP is a Cancel and we have an active alert for the same key, post an all clear.
-                # If we do not have an active alert, we skip tweeting the cancel to avoid confusion.
-                if is_cancel(cap):
-                    active = active_alerts.get(key)
-                    if not (isinstance(active, dict) and active.get("active") is True):
-                        # No known active alert to clear
-                        posted_guids.add(guid)
+                    if is_in_cooldown(state, cap):
+                        tweets_skipped_cooldown += 1
+                        print("Tweet skipped due to cooldown:", cooldown_key(cap))
                         continue
 
-                    prev_event = (active.get("event") or "").strip() or (cap.get("event") or "").strip() or "Weather alert"
-                    areas = cap.get("areas") or []
-                    area = areas[0].strip() if areas else (active.get("area") or "Tay area")
-                    tags = hashtag_pack(cap)
+                    text = tweet_text_for(cap)
+                    print("Tweet text preview:", text.replace("\n", " | ")[:240])
 
-                    clear_text = X_TEMPLATE_ALL_CLEAR.format(
-                        area=area,
-                        event=prev_event,
-                        url=MORE_INFO_URL,
-                        tags=tags,
-                    )
-                    clear_text = x_trim(re.sub(r"\n{3,}", "\n\n", clear_text).strip(), 280)
+                    x_post(text)
+                    tweets_sent += 1
+                    mark_cooldown(state, cap)
+                else:
+                    if POST_TO_X:
+                        print("X posting is enabled but credentials are missing. Skipping tweets.")
 
-                    try:
-                        tweet_id = post_to_x(clear_text)
-                        posted_tweets[guid] = tweet_id
-                        posted_guids.add(guid)
-                        increment_tweet_today(state)
-                        new_tweets += 1
-
-                        # Mark as no longer active
-                        active_alerts[key] = {
-                            "active": False,
-                            "event": prev_event,
-                            "area": area,
-                            "last_change_ts": now_ts,
-                            "last_guid": guid,
-                        }
-                    except Exception as e:
-                        print(f"X post failed (all clear): {e}")
-
-                    continue
-
-                # Normal alert or SWS
-                try:
-                    x_text = format_x_post(cap, MORE_INFO_URL)
-                    tweet_id = post_to_x(x_text)
-                    posted_tweets[guid] = tweet_id
-                    posted_guids.add(guid)
-                    increment_tweet_today(state)
-                    new_tweets += 1
-
-                    # Track actives: only treat non-SWS alerts as active for all clear
-                    areas = cap.get("areas") or []
-                    area = areas[0].strip() if areas else "Tay area"
-                    if not is_sws(cap):
-                        active_alerts[key] = {
-                            "active": True,
-                            "event": (cap.get("event") or "").strip(),
-                            "area": area,
-                            "last_change_ts": now_ts,
-                            "last_guid": guid,
-                        }
-
-                except Exception as e:
-                    print(f"X post failed: {e}")
-
-    # Update RSS metadata
-    now_rfc = email.utils.format_datetime(dt.datetime.now(dt.timezone.utc))
+    # Update lastBuildDate
+    now_rfc = email.utils.format_datetime(now_utc())
     lbd = channel.find("lastBuildDate")
     if lbd is None:
         lbd = ET.SubElement(channel, "lastBuildDate")
@@ -703,17 +589,18 @@ def main():
 
     trim_rss_items(channel, MAX_RSS_ITEMS)
 
-    # Save outputs
+    # Save RSS + state
     tree.write(RSS_PATH, encoding="utf-8", xml_declaration=True)
-
     state["seen_ids"] = list(seen)
-    state["cooldowns"] = cooldowns
-    state["posted_guids"] = list(posted_guids)
-    state["posted_tweets"] = posted_tweets
-    state["active_alerts"] = active_alerts
     save_state(state)
 
-    print(f"Done. Added {new_items} RSS item(s). Posted {new_tweets} tweet(s).")
+    print(
+        "Run summary:",
+        f"new_rss_items_added={new_rss_items}",
+        f"tweets_attempted={tweets_attempted}",
+        f"tweets_sent={tweets_sent}",
+        f"tweets_skipped_cooldown={tweets_skipped_cooldown}",
+    )
 
 
 if __name__ == "__main__":
