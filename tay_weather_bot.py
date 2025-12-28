@@ -49,9 +49,23 @@ def normalize(s: str) -> str:
 
 
 def load_state() -> dict:
-    if os.path.exists(STATE_PATH):
+    """
+    Load state.json safely.
+    If the file is missing, empty, or invalid JSON,
+    reset to a clean default instead of crashing.
+    """
+    if not os.path.exists(STATE_PATH):
+        return {"seen_ids": []}
+
+    try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict) and "seen_ids" in data:
+                return data
+    except Exception:
+        pass
+
+    # Fallback: reset corrupted state
     return {"seen_ids": []}
 
 
