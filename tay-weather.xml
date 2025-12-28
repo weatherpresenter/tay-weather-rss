@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Tay Township Weather Statements</title>
+    <link>https://weatherpresenter.github.io/tay-weather-rss/</link>
+    <description>
+      Automated Special Weather Statements for Victoria Harbour, Port McNicoll,
+      Waubaushene and Waverley.
+    </description>
+    <language>en-ca</language>
+  </channel>
+</rss>
