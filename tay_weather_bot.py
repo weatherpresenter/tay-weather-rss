@@ -4,26 +4,26 @@
 # - Pulls Environment Canada (Weather Canada) CAP alerts from Datamart
 # - Filters to Tay-area regions (Victoria Harbour, Port McNicoll, Waubaushene, Waverley + EC region names)
 # - Writes RSS feed: tay-weather.xml
-# - Posts to X (Twitter) automatically (with cooldowns + dedupe)
-# - Supports "all clear" follow-up for Cancel messages
+# - Posts to X (Twitter / X) automatically using OAuth 2.0 (refresh token)
+# - Supports cooldowns + dedupe + "all clear" follow-up for Cancel messages
 #
 # REQUIRED GitHub Secrets (repo Settings > Secrets and variables > Actions):
-#   X_API_KEY
-#   X_API_SECRET
-#   X_ACCESS_TOKEN
-#   X_ACCESS_TOKEN_SECRET
+#   X_CLIENT_ID
+#   X_CLIENT_SECRET
+#   X_REFRESH_TOKEN
 #
 # OPTIONAL Workflow env vars:
 #   TEST_TWEET=true   -> forces a test tweet and exits
 #
 # Files:
-#   state.json        -> auto-maintained; tracks seen CAP IDs and cooldowns
+#   state.json        -> auto-maintained; tracks seen CAP IDs, posted GUIDs, cooldowns
 #   tay-weather.xml   -> RSS output
 #
 # Notes:
-# - IMPORTANT: Environment Canada CAP areaDesc usually uses region names (ex: "Midland - Coldwater - Orr Lake")
-#   Hamlet names may not appear. Add the exact region strings you see inside CAP <areaDesc> to AREA_KEYWORDS.
+# - IMPORTANT: Environment Canada CAP areaDesc uses official region names (ex: "Midland - Coldwater - Orr Lake").
+#   Hamlet names may not appear. Add exact region strings you see inside CAP <areaDesc> to AREA_KEYWORDS.
 #
+import base64
 import json
 import os
 import re
@@ -37,7 +37,6 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from requests_oauthlib import OAuth1
 
 
 # ----------------------------
@@ -50,7 +49,7 @@ INCLUDE_ALERTS = True  # warnings/watches/advisories etc.
 # If False: also match on headline/description fallback (can create false positives).
 STRICT_AREA_MATCH = True
 
-# Post to X (Twitter). If you only want RSS, set False.
+# Post to X. If you only want RSS, set False.
 POST_TO_X = True
 
 # ----------------------------
@@ -67,7 +66,7 @@ EXCLUDED_EVENTS = {
 # ----------------------------
 # IMPORTANT:
 # - With STRICT_AREA_MATCH=True, these should reflect EC region names appearing in CAP <areaDesc>.
-# - Hamlet names can stay as "nice-to-have", but they often won't match areaDesc. Add region names.
+# - Hamlet names can stay as "nice-to-have", but they often won't match areaDesc.
 AREA_KEYWORDS = [
     # Tay hamlets (may not appear in CAP areaDesc)
     "Victoria Harbour",
@@ -75,7 +74,7 @@ AREA_KEYWORDS = [
     "Waubaushene",
     "Waverley",
 
-    # Common EC region names that can cover Tay-area communities (update based on real CAP files)
+    # Common EC region names that can cover Tay-area communities (UPDATE based on real CAP files)
     "Midland - Coldwater - Orr Lake",
     "Midland - Penetanguishene",
     "Southern Georgian Bay",
@@ -101,7 +100,6 @@ MORE_INFO_URL = "https://weather.gc.ca/warnings/index_e.html?prov=on"
 # ----------------------------
 # Cooldown policy (recommended)
 # ----------------------------
-# Cooldown per "group" (area + event kind) to reduce repeats during CAP updates.
 COOLDOWN_MINUTES = {
     "warning": 60,
     "watch": 120,
@@ -116,7 +114,7 @@ COOLDOWN_MINUTES = {
 GLOBAL_COOLDOWN_MINUTES = 5
 
 # ----------------------------
-# X (Twitter) templates
+# X templates
 # ----------------------------
 # Keep these concise; bot will trim to 280.
 TWEET_TEMPLATES = {
@@ -308,7 +306,6 @@ def should_include_event(cap: Dict[str, Any]) -> bool:
     if is_sws and INCLUDE_SPECIAL_WEATHER_STATEMENTS:
         return True
 
-    # Treat everything else as an alert family
     if (not is_sws) and INCLUDE_ALERTS:
         return True
 
@@ -316,10 +313,6 @@ def should_include_event(cap: Dict[str, Any]) -> bool:
 
 
 def area_matches(cap: Dict[str, Any]) -> bool:
-    """
-    Recommended:
-    - STRICT_AREA_MATCH=True -> only CAP <areaDesc> matching (prevents unrelated regions)
-    """
     areas = cap.get("areas", []) or []
     hay_area = normalize(" | ".join(areas))
 
@@ -475,7 +468,7 @@ def is_all_clear(cap: Dict[str, Any]) -> bool:
 
     if msg_type == "cancel":
         return True
-    if "has ended" in headline or "ended" in headline:
+    if "has ended" in headline or " ended" in headline:
         return True
     if "has ended" in desc:
         return True
@@ -526,38 +519,60 @@ def mark_posted(state: Dict[str, Any], cap: Dict[str, Any]) -> None:
 
 
 # ----------------------------
-# X (Twitter) posting helpers
+# X (OAuth 2.0) helpers
 # ----------------------------
-def x_auth_from_env() -> OAuth1:
-    api_key = os.getenv("X_API_KEY", "").strip()
-    api_secret = os.getenv("X_API_SECRET", "").strip()
-    access_token = os.getenv("X_ACCESS_TOKEN", "").strip()
-    access_secret = os.getenv("X_ACCESS_TOKEN_SECRET", "").strip()
+def get_oauth2_access_token() -> str:
+    """
+    Uses refresh token to mint a short-lived access token.
+    """
+    client_id = os.getenv("X_CLIENT_ID", "").strip()
+    client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
+    refresh_token = os.getenv("X_REFRESH_TOKEN", "").strip()
 
     missing = [k for k, v in [
-        ("X_API_KEY", api_key),
-        ("X_API_SECRET", api_secret),
-        ("X_ACCESS_TOKEN", access_token),
-        ("X_ACCESS_TOKEN_SECRET", access_secret),
+        ("X_CLIENT_ID", client_id),
+        ("X_CLIENT_SECRET", client_secret),
+        ("X_REFRESH_TOKEN", refresh_token),
     ] if not v]
     if missing:
         raise RuntimeError(f"Missing required X env vars: {', '.join(missing)}")
 
-    return OAuth1(api_key, api_secret, access_token, access_secret)
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    r = requests.post("https://api.x.com/2/oauth2/token", headers=headers, data=data, timeout=30)
+    print("X token refresh:", r.status_code, r.text[:300])
+    r.raise_for_status()
+
+    payload = r.json()
+    access = payload.get("access_token")
+    if not access:
+        raise RuntimeError("No access_token returned during refresh.")
+    return access
 
 
 def post_to_x(text: str) -> Dict[str, Any]:
     """
     X API v2: POST /2/tweets
-    Raises on failure so GitHub Actions goes red.
     """
     url = "https://api.x.com/2/tweets"
-    auth = x_auth_from_env()
+    access_token = get_oauth2_access_token()
     r = requests.post(
         url,
-        auth=auth,
         json={"text": text},
-        headers={"User-Agent": USER_AGENT},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+        },
         timeout=20,
     )
     print("X POST /2/tweets:", r.status_code, r.text[:500])
