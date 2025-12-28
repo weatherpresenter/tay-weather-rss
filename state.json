@@ -2,5 +2,7 @@
   "seen_ids": [],
   "cooldowns": {},
   "posted_guids": [],
-  "daily_counts": {}
+  "daily_counts": {},
+  "posted_tweets": {},
+  "active_alerts": {}
 }
