@@ -1,4 +1,6 @@
 {
   "seen_ids": [],
-  "cooldowns": {}
+  "cooldowns": {},
+  "posted_guids": [],
+  "daily_counts": {}
 }
