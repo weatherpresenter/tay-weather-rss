@@ -271,12 +271,18 @@ def should_include_event(cap: dict) -> bool:
 
 
 def area_matches(cap: dict) -> bool:
-    hay = normalize(" | ".join(cap.get("areas", [])))
-    fallback = normalize((cap.get("headline") or "") + " " + (cap.get("description") or ""))
+    # Only match on areaDesc (official regions), not description/headline
+    areas = [normalize(a) for a in cap.get("areas", []) if a]
+    if not areas:
+        return False
+
     for kw in AREA_KEYWORDS:
         nkw = normalize(kw)
-        if nkw and (nkw in hay or nkw in fallback):
+        if not nkw:
+            continue
+        if any(nkw in a for a in areas):
             return True
+
     return False
 
 
