@@ -565,7 +565,9 @@ def post_to_x(text: str) -> Dict[str, Any]:
         },
         timeout=20,
     )
-    print("X POST /2/tweets:", r.status_code, r.text[:500])
+    # IMPORTANT: Never print response bodies. They can contain sensitive details,
+    # and GitHub Actions logs are persistent.
+    print("X POST /2/tweets status:", r.status_code)
     if r.status_code >= 400:
         # X returns 403 for duplicate tweet text. Treat as a soft failure so the
         # workflow can continue and state can be updated to prevent retries.
@@ -576,7 +578,8 @@ def post_to_x(text: str) -> Dict[str, Any]:
             detail = ""
         if r.status_code == 403 and "duplicate" in detail:
             raise RuntimeError("X_DUPLICATE_TWEET")
-        raise RuntimeError(f"X post failed {r.status_code}: {r.text}")
+        # Do not include r.text in errors (it lands in logs).
+        raise RuntimeError(f"X post failed {r.status_code}")
     return r.json()
 
 
@@ -595,9 +598,18 @@ def post_to_facebook_page(message: str) -> Dict[str, Any]:
 
     url = f"https://graph.facebook.com/v24.0/{page_id}/feed"
     r = requests.post(url, data={"message": message, "access_token": page_token}, timeout=30)
-    print("FB POST /feed:", r.status_code, r.text[:500])
+    # IMPORTANT: Never print response bodies in CI logs.
+    print("FB POST /feed status:", r.status_code)
     if r.status_code >= 400:
-        raise RuntimeError(f"Facebook post failed {r.status_code}: {r.text}")
+        # FB errors are usually safe, but still avoid dumping full bodies.
+        try:
+            j = r.json()
+            msg = (((j.get("error") or {}).get("message")) or "").strip()
+        except Exception:
+            msg = ""
+        if msg:
+            raise RuntimeError(f"Facebook post failed {r.status_code}: {msg}")
+        raise RuntimeError(f"Facebook post failed {r.status_code}")
     return r.json()
 
 
