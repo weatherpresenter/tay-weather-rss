@@ -35,15 +35,35 @@ jobs:
           X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
           X_CLIENT_SECRET: ${{ secrets.X_CLIENT_SECRET }}
           X_REFRESH_TOKEN: ${{ secrets.X_REFRESH_TOKEN }}
+
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+
+          # optional:
+          # TEST_TWEET: "true"
+          X_REFRESH_TOKEN_ROTATED_PATH: "x_refresh_token_rotated.txt"
         run: |
           python tay_weather_bot.py
+
+      - name: Update X_REFRESH_TOKEN secret if rotated
+        # Needs a PAT with permission to edit repo secrets.
+        # Store it as a repo secret called GH_SECRETS_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+        run: |
+          if [ -f "x_refresh_token_rotated.txt" ]; then
+            echo "Rotated X refresh token detected; updating GitHub secret..."
+            gh secret set X_REFRESH_TOKEN --body "$(cat x_refresh_token_rotated.txt)"
+            rm -f x_refresh_token_rotated.txt
+          else
+            echo "No rotated refresh token file."
+          fi
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add tay-weather.xml state.json
           if git diff --cached --quiet; then
             echo "No changes to commit"
