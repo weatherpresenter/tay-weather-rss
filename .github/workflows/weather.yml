@@ -32,15 +32,16 @@ jobs:
         env:
           ENABLE_X_POSTING: "true"
           ENABLE_FB_POSTING: "true"
+
           X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
           X_CLIENT_SECRET: ${{ secrets.X_CLIENT_SECRET }}
           X_REFRESH_TOKEN: ${{ secrets.X_REFRESH_TOKEN }}
+
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
         run: |
           python tay_weather_bot.py
 
-      # If X rotated your refresh token, update the repo secret automatically
       - name: Update X_REFRESH_TOKEN secret if rotated
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_ACTIONS_SECRETS }}
@@ -59,7 +60,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add tay-weather.xml state.json
+          git add tay-weather.xml state.json || true
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
