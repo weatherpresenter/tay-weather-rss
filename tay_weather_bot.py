@@ -5,19 +5,28 @@
 # - Filters to Tay-area regions (strict allow-list match on CAP <areaDesc>)
 # - Writes RSS feed: tay-weather.xml
 # - Posts to X automatically using OAuth 2.0 (refresh token)
-# - Supports cooldowns + dedupe + optional "all clear" follow-up for Cancel messages
+# - Posts to Facebook Page automatically (Page access token)
+# - Supports cooldowns + dedupe + "all clear" follow-up for Cancel messages
 #
 # REQUIRED GitHub Secrets (repo Settings > Secrets and variables > Actions):
 #   X_CLIENT_ID
 #   X_CLIENT_SECRET
 #   X_REFRESH_TOKEN
+#   FB_PAGE_ID
+#   FB_PAGE_ACCESS_TOKEN
 #
 # OPTIONAL Workflow env vars:
-#   TEST_TWEET=true   -> forces a test tweet and exits
+#   ENABLE_X_POSTING=true|false
+#   ENABLE_FB_POSTING=true|false
+#   TEST_TWEET=true        -> forces a test post to enabled socials and exits
 #
 # Files:
-#   state.json        -> auto-maintained; tracks seen CAP IDs, posted GUIDs, cooldowns
+#   state.json        -> auto-maintained; tracks seen CAP IDs, posted GUIDs, cooldowns, last social post times
 #   tay-weather.xml   -> RSS output
+#
+# Notes:
+# - CAP areaDesc uses official forecast/marine region names (ex: "Midland - Coldwater - Orr Lake").
+# - Maintain AREA_ALLOWLIST with exact strings that appear inside CAP <areaDesc>.
 #
 import base64
 import json
@@ -41,11 +50,13 @@ from bs4 import BeautifulSoup
 INCLUDE_SPECIAL_WEATHER_STATEMENTS = True
 INCLUDE_ALERTS = True  # warnings/watches/advisories etc.
 
-# If True: require CAP <areaDesc> to match allow-list (recommended).
+# Strict allow-list for CAP <areaDesc>.
 STRICT_AREA_MATCH = True
 
-# Post to X. If you only want RSS, set False.
-POST_TO_X = True
+# Runtime enables (from workflow env)
+ENABLE_X_POSTING = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
+ENABLE_FB_POSTING = os.getenv("ENABLE_FB_POSTING", "false").lower() == "true"
+TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
 
 # ----------------------------
 # Exclusions
@@ -57,15 +68,13 @@ EXCLUDED_EVENTS = {
 }
 
 # ----------------------------
-# Tay / target areas
+# Tay / target areas (exact CAP <areaDesc> strings)
 # ----------------------------
-# Strict allow-list for CAP <areaDesc>. Only these exact areaDesc values will pass.
-# Add additional exact strings you see in CAP <areaDesc> that actually cover Tay.
 AREA_ALLOWLIST = [
-    # Land (Tay forecast region)
+    # Land (Tay region)
     "Midland - Coldwater - Orr Lake",
 
-    # Marine (optional)
+    # Marine (if you want marine alerts)
     "Southern Georgian Bay",
 ]
 
@@ -84,8 +93,9 @@ RSS_PATH = "tay-weather.xml"
 
 USER_AGENT = "tay-weather-rss-bot/1.0"
 
-# Use your preferred “more info” URL (avoid linking CAP files, which can 404 later)
+# “More info” URL (stable; avoids CAP link 404s)
 MORE_INFO_URL = "https://weather.gc.ca/?zoom=11&center=44.80743105,-79.69598152"
+
 
 # ----------------------------
 # Cooldown policy
@@ -100,11 +110,12 @@ COOLDOWN_MINUTES = {
     "default": 180,
 }
 
-# Minimum time between ANY two posts (global throttle)
+# Minimum time between ANY two social posts (global throttle)
 GLOBAL_COOLDOWN_MINUTES = 5
 
+
 # ----------------------------
-# X templates
+# Social templates (X and FB share these)
 # ----------------------------
 TWEET_TEMPLATES = {
     "alert": (
@@ -129,8 +140,6 @@ TWEET_TEMPLATES = {
     ),
 }
 
-TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
-
 
 # ----------------------------
 # Generic helpers
@@ -142,9 +151,6 @@ def normalize(s: str) -> str:
     s = s.replace("–", "-").replace("—", "-")
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
-
-ALLOWLIST_NORM = {normalize(a) for a in AREA_ALLOWLIST}
 
 
 def now_utc() -> dt.datetime:
@@ -163,12 +169,19 @@ def load_state() -> dict:
     state.json structure:
     {
       "seen_ids": [],
-      "posted_guids": [],
+      "posted_guids_x": [],
+      "posted_guids_fb": [],
       "cooldowns": { "group_key": 1735390000 },
       "global_last_post_ts": 0
     }
     """
-    default = {"seen_ids": [], "posted_guids": [], "cooldowns": {}, "global_last_post_ts": 0}
+    default = {
+        "seen_ids": [],
+        "posted_guids_x": [],
+        "posted_guids_fb": [],
+        "cooldowns": {},
+        "global_last_post_ts": 0,
+    }
 
     if not os.path.exists(STATE_PATH):
         return default
@@ -184,7 +197,8 @@ def load_state() -> dict:
         return default
 
     data.setdefault("seen_ids", [])
-    data.setdefault("posted_guids", [])
+    data.setdefault("posted_guids_x", [])
+    data.setdefault("posted_guids_fb", [])
     data.setdefault("cooldowns", {})
     data.setdefault("global_last_post_ts", 0)
     return data
@@ -193,7 +207,8 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     # Prevent endless growth
     state["seen_ids"] = state.get("seen_ids", [])[-5000:]
-    state["posted_guids"] = state.get("posted_guids", [])[-5000:]
+    state["posted_guids_x"] = state.get("posted_guids_x", [])[-5000:]
+    state["posted_guids_fb"] = state.get("posted_guids_fb", [])[-5000:]
 
     # Trim cooldown map
     cds = state.get("cooldowns", {})
@@ -257,7 +272,7 @@ def parse_cap(xml_text: str) -> Dict[str, Any]:
     description = find_text(info, "description")
     instruction = find_text(info, "instruction")
 
-    msg_type = find_text(info, "msgType")  # Alert | Update | Cancel
+    msg_type = find_text(info, "msgType")  # Alert | Update | Cancel (typical)
     severity = find_text(info, "severity")
     urgency = find_text(info, "urgency")
     certainty = find_text(info, "certainty")
@@ -304,23 +319,22 @@ def should_include_event(cap: Dict[str, Any]) -> bool:
     return False
 
 
-def matched_areas(cap: Dict[str, Any]) -> List[str]:
-    """
-    Returns only the CAP areaDesc strings that are in our allow-list.
-    This prevents unrelated regions from appearing in tweets/RSS (Uxbridge, Lambton, etc.).
-    """
-    areas = cap.get("areas", []) or []
-    return [a for a in areas if normalize(a) in ALLOWLIST_NORM]
-
-
 def area_matches(cap: Dict[str, Any]) -> bool:
     """
-    True only if at least one CAP <areaDesc> matches an allow-listed EC region.
+    True only if at least one CAP <areaDesc> matches an allowlisted EC region.
+    This prevents unrelated Ontario regions from posting.
     """
     areas = cap.get("areas", []) or []
     if STRICT_AREA_MATCH and not areas:
         return False
-    return len(matched_areas(cap)) > 0
+
+    areas_norm = [normalize(a) for a in areas]
+
+    for allowed in AREA_ALLOWLIST:
+        if normalize(allowed) in areas_norm:
+            return True
+
+    return False
 
 
 def rfc2822_date_from_sent(sent: str) -> str:
@@ -400,9 +414,9 @@ def trim_rss_items(channel: ET.Element, max_items: int) -> None:
 
 def build_rss_description(cap: Dict[str, Any]) -> str:
     bits = []
-    areas = matched_areas(cap)
+    areas = cap.get("areas", []) or []
     if areas:
-        bits.append("Area: " + ", ".join(areas))
+        bits.append(f"Area: {areas[0]}")
 
     if cap.get("event"):
         bits.append(f"Event: {cap['event'].strip()}")
@@ -433,12 +447,14 @@ def classify_event_kind(cap: Dict[str, Any]) -> str:
 
     if event == "special weather statement" or "special weather statement" in headline:
         return "statement"
+
     if "warning" in headline or "warning" in event:
         return "warning"
     if "watch" in headline or "watch" in event:
         return "watch"
     if "advisory" in headline or "advisory" in event:
         return "advisory"
+
     return "alert"
 
 
@@ -457,7 +473,7 @@ def is_all_clear(cap: Dict[str, Any]) -> bool:
 
 
 def group_key_for_cooldown(cap: Dict[str, Any]) -> str:
-    areas = matched_areas(cap)
+    areas = cap.get("areas", []) or []
     area_primary = areas[0] if areas else ""
     kind = "allclear" if is_all_clear(cap) else classify_event_kind(cap)
     raw = f"{normalize(area_primary)}|{kind}"
@@ -500,14 +516,11 @@ def mark_posted(state: Dict[str, Any], cap: Dict[str, Any]) -> None:
 # ----------------------------
 # X (OAuth 2.0) helpers
 # ----------------------------
-TOKEN_URL = "https://api.x.com/2/oauth2/token"
-
-
 def get_oauth2_access_token() -> str:
     """
     Uses refresh token to mint a short-lived access token.
-    X may rotate refresh tokens; if a new refresh_token is returned, we print it
-    so you can update GitHub Secret X_REFRESH_TOKEN.
+    X may rotate refresh tokens; if you see a new refresh_token printed,
+    update your GitHub Secret X_REFRESH_TOKEN.
     """
     client_id = os.getenv("X_CLIENT_ID", "").strip()
     client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
@@ -532,7 +545,7 @@ def get_oauth2_access_token() -> str:
         "refresh_token": refresh_token,
     }
 
-    r = requests.post(TOKEN_URL, headers=headers, data=data, timeout=30)
+    r = requests.post("https://api.x.com/2/oauth2/token", headers=headers, data=data, timeout=30)
     print("X token refresh:", r.status_code, r.text[:400])
     r.raise_for_status()
 
@@ -550,9 +563,6 @@ def get_oauth2_access_token() -> str:
 
 
 def post_to_x(text: str) -> Dict[str, Any]:
-    """
-    X API v2: POST /2/tweets
-    """
     url = "https://api.x.com/2/tweets"
     access_token = get_oauth2_access_token()
     r = requests.post(
@@ -571,18 +581,59 @@ def post_to_x(text: str) -> Dict[str, Any]:
     return r.json()
 
 
+# ----------------------------
+# Facebook (Pages) posting helpers
+# ----------------------------
+def fb_creds_from_env() -> Tuple[str, str]:
+    page_id = os.getenv("FB_PAGE_ID", "").strip()
+    page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
+
+    missing = [k for k, v in [
+        ("FB_PAGE_ID", page_id),
+        ("FB_PAGE_ACCESS_TOKEN", page_token),
+    ] if not v]
+    if missing:
+        raise RuntimeError(f"Missing required Facebook env vars: {', '.join(missing)}")
+
+    return page_id, page_token
+
+
+def post_to_facebook(message: str) -> Dict[str, Any]:
+    """
+    Posts to a Facebook Page feed using a Page access token:
+      POST /{page_id}/feed
+    """
+    page_id, page_token = fb_creds_from_env()
+    url = f"https://graph.facebook.com/v24.0/{page_id}/feed"
+    r = requests.post(
+        url,
+        data={"message": message, "access_token": page_token},
+        headers={"User-Agent": USER_AGENT},
+        timeout=20,
+    )
+    print("FB POST /feed:", r.status_code, r.text[:500])
+    if r.status_code >= 400:
+        raise RuntimeError(f"Facebook post failed {r.status_code}: {r.text}")
+    return r.json()
+
+
+# ----------------------------
+# Social message building
+# ----------------------------
 def build_areas_short(cap: Dict[str, Any]) -> str:
-    areas = matched_areas(cap)
+    areas = cap.get("areas", []) or []
     if not areas:
         return "Tay Township area"
-    s = ", ".join(areas)
-    return s if len(s) <= 70 else (s[:67].rstrip() + "…")
+    s = areas[0].strip()
+    if len(s) > 70:
+        s = s[:67].rstrip() + "…"
+    return s
 
 
 def extract_advice_short(cap: Dict[str, Any]) -> str:
     inst = (cap.get("instruction") or "").strip()
     if inst:
-        return inst if len(inst) <= 120 else (inst[:117].rstrip() + "…")
+        return inst if len(inst) <= 160 else (inst[:157].rstrip() + "…")
 
     desc = (cap.get("description") or "").strip()
     if not desc:
@@ -590,12 +641,12 @@ def extract_advice_short(cap: Dict[str, Any]) -> str:
 
     parts = re.split(r"(?<=[.!?])\s+", desc)
     first = (parts[0] if parts else desc).strip()
-    if len(first) > 120:
-        first = first[:117].rstrip() + "…"
+    if len(first) > 160:
+        first = first[:157].rstrip() + "…"
     return first
 
 
-def build_tweet_text(cap: Dict[str, Any]) -> str:
+def build_social_text(cap: Dict[str, Any]) -> str:
     areas_short = build_areas_short(cap)
     headline = (cap.get("headline") or "").strip() or (cap.get("event") or "Weather alert").strip()
     advice = extract_advice_short(cap)
@@ -619,6 +670,7 @@ def build_tweet_text(cap: Dict[str, Any]) -> str:
             more_info=MORE_INFO_URL,
         )
 
+    # X limit is 280; FB is higher. We'll keep it short and consistent.
     if len(text) > 280:
         text = text[:277].rstrip() + "…"
     return text
@@ -629,22 +681,34 @@ def build_tweet_text(cap: Dict[str, Any]) -> str:
 # ----------------------------
 def main() -> None:
     if TEST_TWEET:
-        if not POST_TO_X:
-            raise RuntimeError("TEST_TWEET requested but POST_TO_X is False.")
-        print("TEST_TWEET is true. Posting a test tweet and exiting.")
-        post_to_x("Test tweet from Tay weather bot ✅")
-        print("Test tweet sent.")
+        msg = "Test post from Tay weather bot ✅"
+        print("TEST_TWEET is true. Posting test message to enabled platforms and exiting.")
+
+        if ENABLE_X_POSTING:
+            post_to_x(msg)
+            print("Test post sent to X.")
+        else:
+            print("X posting disabled (ENABLE_X_POSTING=false).")
+
+        if ENABLE_FB_POSTING:
+            post_to_facebook(msg)
+            print("Test post sent to Facebook.")
+        else:
+            print("Facebook posting disabled (ENABLE_FB_POSTING=false).")
+
         return
 
     state = load_state()
     seen = set(state.get("seen_ids", []))
-    posted = set(state.get("posted_guids", []))
+    posted_x = set(state.get("posted_guids_x", []))
+    posted_fb = set(state.get("posted_guids_fb", []))
 
     tree, channel = load_rss_tree()
 
     new_rss_items = 0
-    tweets_posted = 0
-    tweets_skipped_cooldown = 0
+    x_posts = 0
+    fb_posts = 0
+    skipped_cooldown = 0
 
     for yyyymmdd, hh in utc_dirs_to_check(HOURS_BACK_TO_SCAN):
         for office in OFFICES:
@@ -653,7 +717,6 @@ def main() -> None:
             try:
                 cap_urls = list_cap_files(directory_url)
             except Exception as e:
-                # 404 directories are normal sometimes; just move on
                 print("Directory fetch failed:", directory_url, str(e))
                 continue
 
@@ -670,46 +733,58 @@ def main() -> None:
                 if not cap_id:
                     continue
 
+                # Dedupe scanning
                 if cap_id in seen:
                     continue
                 seen.add(cap_id)
 
+                # Filters
                 if not should_include_event(cap):
                     continue
                 if not area_matches(cap):
                     continue
 
-                # Use stable link instead of CAP URL
-                link = MORE_INFO_URL
-
+                # RSS item fields
                 title = (cap.get("headline") or cap.get("event") or "Weather alert").strip()
                 pub_date = rfc2822_date_from_sent(cap.get("sent", ""))
                 guid = cap_id
+
+                # Stable link to avoid 404 CAP links
+                link = MORE_INFO_URL
                 description = build_rss_description(cap)
 
                 if not rss_item_exists(channel, guid):
                     add_rss_item(channel, title=title, link=link, guid=guid, pub_date=pub_date, description=description)
                     new_rss_items += 1
 
-                if POST_TO_X:
-                    if guid in posted:
-                        continue
+                # Social posting
+                allowed, reason = cooldown_allows_post(state, cap)
+                if not allowed:
+                    skipped_cooldown += 1
+                    print("Social post skipped:", reason, "| matched areas:", cap.get("areas", []))
+                    continue
 
-                    allowed, reason = cooldown_allows_post(state, cap)
-                    if not allowed:
-                        tweets_skipped_cooldown += 1
-                        print("Tweet skipped:", reason)
-                        continue
+                social_text = build_social_text(cap)
+                print("Social preview:", social_text.replace("\n", " | ")[:260])
+                print("Matched areas:", cap.get("areas", []))
 
-                    tweet_text = build_tweet_text(cap)
-                    print("Tweet preview:", tweet_text.replace("\n", " | ")[:240])
-                    print("Matched areas:", matched_areas(cap))
+                # Post to X (dedupe per platform)
+                if ENABLE_X_POSTING and guid not in posted_x:
+                    post_to_x(social_text)
+                    posted_x.add(guid)
+                    x_posts += 1
 
-                    post_to_x(tweet_text)
-                    tweets_posted += 1
-                    posted.add(guid)
+                # Post to Facebook (dedupe per platform)
+                if ENABLE_FB_POSTING and guid not in posted_fb:
+                    post_to_facebook(social_text)
+                    posted_fb.add(guid)
+                    fb_posts += 1
+
+                # Only mark cooldown if at least one post happened
+                if (ENABLE_X_POSTING and guid in posted_x) or (ENABLE_FB_POSTING and guid in posted_fb):
                     mark_posted(state, cap)
 
+    # Update lastBuildDate
     lbd = channel.find("lastBuildDate")
     if lbd is None:
         lbd = ET.SubElement(channel, "lastBuildDate")
@@ -717,16 +792,19 @@ def main() -> None:
 
     trim_rss_items(channel, MAX_RSS_ITEMS)
 
+    # Save RSS + state
     tree.write(RSS_PATH, encoding="utf-8", xml_declaration=True)
     state["seen_ids"] = list(seen)
-    state["posted_guids"] = list(posted)
+    state["posted_guids_x"] = list(posted_x)
+    state["posted_guids_fb"] = list(posted_fb)
     save_state(state)
 
     print(
         "Run summary:",
         f"new_rss_items_added={new_rss_items}",
-        f"tweets_posted={tweets_posted}",
-        f"tweets_skipped_cooldown={tweets_skipped_cooldown}",
+        f"x_posts={x_posts}",
+        f"fb_posts={fb_posts}",
+        f"skipped_cooldown={skipped_cooldown}",
     )
 
 
