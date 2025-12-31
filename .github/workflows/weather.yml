@@ -5,12 +5,17 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: tay-weather-rss
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
 
     steps:
       - name: Check out repo
@@ -30,6 +35,9 @@ jobs:
 
       - name: Run weather bot (RSS + socials)
         env:
+          ALERT_FEED_URL: "https://weather.gc.ca/rss/battleboard/onrm94_e.xml"
+          TAY_COORDS_URL: "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
+
           ENABLE_X_POSTING: "true"
           ENABLE_FB_POSTING: "true"
 
