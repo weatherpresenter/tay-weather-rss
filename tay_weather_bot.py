@@ -767,8 +767,12 @@ def main() -> None:
                             print("X rejected duplicate tweet text; skipping.")
                         else:
                             raise
-                if ENABLE_FB_POSTING:
-                    post_to_facebook_page(social_text)
+                        # Post to Facebook (non-fatal)
+                        if ENABLE_FB_POSTING:
+                            try:
+                                post_to_facebook_page(social_text)
+                            except RuntimeError as e:
+                                    pring(f"Facebook skipped: {e}")
 
                 social_posted += 1
                 posted.add(guid)
