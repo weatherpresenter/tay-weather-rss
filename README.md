@@ -6,15 +6,14 @@ This repository monitors Weather Canada CAP alerts and Special Weather Statement
 - Posts updates to a Facebook Page, when enabled
 
 ## Coverage
-Matches alerts that reference:
-- Victoria Harbour
-- Port McNicoll
-- Waubaushene
-- Waverley
-- Midland - Coldwater - Orr Lake (common regional coverage)
+Alerts are filtered to the ECCC forecast region that covers Tay Township, but public posts use the friendlier label **“Tay Township area”**.
 
 ## How it runs
 GitHub Actions runs every 5 minutes (and can be run manually).
+
+## More info link
+Posts and RSS items link to Tay Township conditions on Weather Canada:
+- https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768
 
 ## Safety features
 - Deduplication: prevents repeat posting of the same alert (by CAP identifier)
