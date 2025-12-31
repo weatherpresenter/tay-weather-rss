@@ -92,7 +92,16 @@ RSS_PATH = "tay-weather.xml"
 USER_AGENT = "tay-weather-rss-bot/1.0"
 
 # Stable public “more info” URL (avoid CAP link 404s)
-MORE_INFO_URL = "https://weather.gc.ca/?zoom=11&center=44.80743105,-79.69598152"
+MORE_INFO_URL = "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
+
+# Tay Township "conditions" landing pages (coords format)
+TAY_COORDS_URL = "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
+WAUBAUSHENE_COORDS_URL = "https://weather.gc.ca/en/location/index.html?coords=44.754,-79.710"
+VICTORIA_HARBOUR_COORDS_URL = "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
+PORT_MCNICOLL_COORDS_URL = "https://weather.gc.ca/en/location/index.html?coords=44.749,-79.811"
+
+# Display name to use in social posts (instead of ECCC forecast-region strings)
+TAY_DISPLAY_AREA = "Tay Township area"
 
 # When X rotates refresh tokens, we write the newest value here
 ROTATED_X_REFRESH_TOKEN_PATH = "x_refresh_token_rotated.txt"
@@ -583,6 +592,7 @@ def post_to_x(text: str) -> Dict[str, Any]:
     return r.json()
 
 
+
 # ----------------------------
 # Facebook Page posting helpers
 # ----------------------------
@@ -613,14 +623,16 @@ def post_to_facebook_page(message: str) -> Dict[str, Any]:
     return r.json()
 
 
+
 def build_areas_short(cap: Dict[str, Any]) -> str:
-    area = primary_allowlisted_area(cap)
-    if not area:
-        return "Tay Township area"
-    s = area.strip()
-    if len(s) > 70:
-        s = s[:67].rstrip() + "…"
-    return s
+    """
+    Return the area label to display publicly.
+
+    We intentionally avoid using long ECCC forecast-region strings (e.g.,
+    "Midland - Coldwater - Orr Lake") in social posts and instead use a
+    Tay-specific label.
+    """
+    return TAY_DISPLAY_AREA
 
 
 def extract_advice_short(cap: Dict[str, Any]) -> str:
@@ -690,6 +702,7 @@ def main() -> None:
     state = load_state()
     seen = set(state.get("seen_ids", []))
     posted = set(state.get("posted_guids", []))
+    posted_text_hashes = set(state.get("posted_text_hashes", []))
     posted_text_hashes = set(state.get("posted_text_hashes", []))
 
     tree, channel = load_rss_tree()
