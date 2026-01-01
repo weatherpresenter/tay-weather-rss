@@ -48,6 +48,10 @@ jobs:
 
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+
+          CR29_NORTH_IMAGE_URL: ${{ vars.CR29_NORTH_IMAGE_URL }}
+          CR29_SOUTH_IMAGE_URL: ${{ vars.CR29_SOUTH_IMAGE_URL }}
+          
         run: |
           python tay_weather_bot.py
 
