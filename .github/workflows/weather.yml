@@ -37,24 +37,32 @@ jobs:
         env:
           ALERT_FEED_URL: "https://weather.gc.ca/rss/battleboard/onrm94_e.xml"
           TAY_COORDS_URL: "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
+
+          # X OAuth 1.0a (required for media upload)
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
-          TEST_TWEET: "false"
-          ENABLE_X_POSTING: "true"
-          ENABLE_FB_POSTING: "true"
 
+          # X OAuth 2.0 (required for posting tweets)
           X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
           X_CLIENT_SECRET: ${{ secrets.X_CLIENT_SECRET }}
           X_REFRESH_TOKEN: ${{ secrets.X_REFRESH_TOKEN }}
 
+          # Facebook page posting
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
 
+          # Camera image URLs (repo variables)
           CR29_NORTH_IMAGE_URL: ${{ vars.CR29_NORTH_IMAGE_URL }}
           CR29_SOUTH_IMAGE_URL: ${{ vars.CR29_SOUTH_IMAGE_URL }}
-          
+
+          # Toggles
+          TEST_TWEET: "false"
+          TEST_JSON: "false"
+          ENABLE_X_POSTING: "true"
+          ENABLE_FB_POSTING: "true"
+
         run: |
           python tay_weather_bot.py
 
