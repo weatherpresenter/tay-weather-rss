@@ -1,26 +1,3 @@
-# tay_weather_bot.py
-#
-# Tay Township Weather Bot
-# - Pulls Environment Canada alerts from regional ATOM feed (source of truth)
-# - Writes RSS feed: tay-weather.xml
-# - Posts to X automatically using OAuth 2.0 (refresh token)
-# - Posts to Facebook Page automatically (Page access token)
-# - Supports cooldowns + dedupe
-#
-# REQUIRED GitHub Secrets:
-#   X_CLIENT_ID
-#   X_CLIENT_SECRET
-#   X_REFRESH_TOKEN
-#   FB_PAGE_ID
-#   FB_PAGE_ACCESS_TOKEN
-#
-# OPTIONAL workflow env vars:
-#   ENABLE_X_POSTING=true|false
-#   ENABLE_FB_POSTING=true|false
-#   TEST_TWEET=true
-#   ALERT_FEED_URL=<ATOM feed url>
-#   TAY_COORDS_URL=<coords link>
-#
 import base64
 import json
 import os
@@ -42,6 +19,7 @@ from requests_oauthlib import OAuth1
 ENABLE_X_POSTING = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
 ENABLE_FB_POSTING = os.getenv("ENABLE_FB_POSTING", "false").lower() == "true"
 TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
+TEST_JSON = os.getenv("TEST_JSON", "false").lower() == "true"
 
 
 # ----------------------------
@@ -109,6 +87,31 @@ def text_hash(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
 
+def severity_emoji(title: str) -> str:
+    """
+    Maps Environment Canada alert types to an emoji.
+    Requested mapping: yellow/red/orange based on severity.
+    """
+    t = (title or "").lower()
+    if "warning" in t:
+        return "🔴"
+    if "watch" in t:
+        return "🟠"
+    if "advisory" in t:
+        return "🟡"
+    if "statement" in t:
+        return "🟡"
+    return "🟡"
+
+
+def get_cr29_image_url() -> str:
+    """
+    Picks North first, then South (you can swap order if you want).
+    """
+    return (os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
+            or os.getenv("CR29_SOUTH_IMAGE_URL", "").strip())
+
+
 def load_state() -> dict:
     default = {
         "seen_ids": [],
@@ -130,11 +133,8 @@ def load_state() -> dict:
     except Exception:
         return default
 
-    data.setdefault("seen_ids", [])
-    data.setdefault("posted_guids", [])
-    data.setdefault("posted_text_hashes", [])
-    data.setdefault("cooldowns", {})
-    data.setdefault("global_last_post_ts", 0)
+    for k, v in default.items():
+        data.setdefault(k, v)
     return data
 
 
@@ -234,7 +234,9 @@ def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
     title = atom_title_for_tay((entry.get("title") or "").strip())
     issued = (entry.get("summary") or "").strip()
 
-    parts = [f"⚠️ {title}"]
+    emoji = severity_emoji(title)
+
+    parts = [f"{emoji} {title}"]
     if issued:
         parts.append(issued)
     parts.append(f"More: {MORE_INFO_URL}")
@@ -406,9 +408,11 @@ def get_oauth2_access_token() -> str:
 
     return access
 
+
 def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
     """
     Downloads an image and returns (bytes, mime_type).
+    Verifies Content-Type starts with image/.
     """
     image_url = (image_url or "").strip()
     if not image_url:
@@ -462,6 +466,7 @@ def x_upload_media(image_url: str) -> str:
 
     return media_id
 
+
 def post_to_x(text: str, image_url: str = "") -> Dict[str, Any]:
     url = "https://api.x.com/2/tweets"
     access_token = get_oauth2_access_token()
@@ -501,6 +506,7 @@ def post_to_x(text: str, image_url: str = "") -> Dict[str, Any]:
 
     return r.json()
 
+
 # ----------------------------
 # Facebook Page posting helpers
 # ----------------------------
@@ -517,7 +523,7 @@ def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     r = requests.post(
         url,
         data={
-            "url": image_url,          # FB fetches this image itself
+            "url": image_url,  # FB fetches this image itself
             "caption": caption,
             "access_token": page_token,
         },
@@ -535,10 +541,51 @@ def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
 
 
 # ----------------------------
+# TEST_JSON mode
+# ----------------------------
+def run_test_json() -> None:
+    """
+    Prints a single JSON object that confirms:
+      - ATOM feed fetch works
+      - we can build a social text
+      - CR29 image URL resolves to an actual image and we can download it
+    No posting occurs.
+    """
+    out: Dict[str, Any] = {
+        "atom_feed": ALERT_FEED_URL,
+        "more_info_url": MORE_INFO_URL,
+        "cr29_image_url": get_cr29_image_url(),
+    }
+
+    # Feed test
+    try:
+        entries = fetch_atom_entries(ALERT_FEED_URL)
+        out["atom_entries"] = len(entries)
+        if entries:
+            out["latest_title"] = entries[0].get("title", "")
+            out["latest_social_text"] = build_social_text_from_atom(entries[0])
+    except Exception as e:
+        out["atom_error"] = str(e)
+
+    # Image test
+    img_url = get_cr29_image_url()
+    if img_url:
+        try:
+            img_bytes, ctype = download_image_bytes(img_url)
+            out["image_ok"] = True
+            out["image_content_type"] = ctype
+            out["image_size_bytes"] = len(img_bytes)
+        except Exception as e:
+            out["image_ok"] = False
+            out["image_error"] = str(e)
+
+    print(json.dumps(out, indent=2))
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main() -> None:
-    
     # Clean up any previous rotated token file
     if os.path.exists(ROTATED_X_REFRESH_TOKEN_PATH):
         try:
@@ -546,21 +593,21 @@ def main() -> None:
         except Exception:
             pass
 
+    if TEST_JSON:
+        run_test_json()
+        return
+
     if TEST_TWEET:
         text = "Test post from Tay weather bot ✅"
-
-        cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
-        cr29_south = os.getenv("CR29_SOUTH_IMAGE_URL", "").strip()
-        image_url = cr29_north or cr29_south
+        image_url = get_cr29_image_url()
 
         if ENABLE_X_POSTING:
             post_to_x(text, image_url=image_url)
 
-        if ENABLE_FB_POSTING:
+        if ENABLE_FB_POSTING and image_url:
             post_photo_to_facebook_page(text, image_url)
 
         return
-
 
     state = load_state()
     posted = set(state.get("posted_guids", []))
@@ -580,6 +627,8 @@ def main() -> None:
         print(f"⚠️ ATOM feed unavailable: {e}")
         print("Exiting cleanly; will retry on next scheduled run.")
         return
+
+    image_url = get_cr29_image_url()
 
     for entry in atom_entries:
         guid = atom_entry_guid(entry)
@@ -621,10 +670,6 @@ def main() -> None:
 
         if ENABLE_X_POSTING:
             try:
-                cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
-                cr29_south = os.getenv("CR29_SOUTH_IMAGE_URL", "").strip()
-                image_url = cr29_north or cr29_south
-
                 post_to_x(social_text, image_url=image_url)
                 posted_anywhere = True
             except RuntimeError as e:
@@ -633,12 +678,8 @@ def main() -> None:
                 else:
                     raise
 
-        if ENABLE_FB_POSTING:
+        if ENABLE_FB_POSTING and image_url:
             try:
-                cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
-                cr29_south = os.getenv("CR29_SOUTH_IMAGE_URL", "").strip()
-                image_url = cr29_north or cr29_south
-
                 post_photo_to_facebook_page(social_text, image_url)
                 posted_anywhere = True
             except RuntimeError as e:
