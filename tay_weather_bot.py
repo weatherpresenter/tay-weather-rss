@@ -546,7 +546,7 @@ def main() -> None:
         except Exception:
             pass
 
-          if TEST_TWEET:
+     if TEST_TWEET:
         text = "Test post from Tay weather bot ✅"
 
         cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
