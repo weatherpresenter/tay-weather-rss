@@ -33,6 +33,7 @@ import xml.etree.ElementTree as ET
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
+from requests_oauthlib import OAuth1
 
 
 # ----------------------------
@@ -405,13 +406,76 @@ def get_oauth2_access_token() -> str:
 
     return access
 
+def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
+    """
+    Downloads an image and returns (bytes, mime_type).
+    """
+    image_url = (image_url or "").strip()
+    if not image_url:
+        raise RuntimeError("No image_url provided")
 
-def post_to_x(text: str) -> Dict[str, Any]:
+    r = requests.get(image_url, headers={"User-Agent": USER_AGENT}, timeout=(10, 30))
+    r.raise_for_status()
+
+    content_type = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if not content_type.startswith("image/"):
+        raise RuntimeError(f"URL did not return an image. Content-Type={content_type}")
+
+    return r.content, content_type
+
+
+def x_upload_media(image_url: str) -> str:
+    """
+    Uploads image to X/Twitter v1.1 media endpoint using OAuth 1.0a user context.
+    Returns media_id_string.
+    """
+    api_key = os.getenv("X_API_KEY", "").strip()
+    api_secret = os.getenv("X_API_SECRET", "").strip()
+    access_token = os.getenv("X_ACCESS_TOKEN", "").strip()
+    access_secret = os.getenv("X_ACCESS_TOKEN_SECRET", "").strip()
+
+    missing = [k for k, v in [
+        ("X_API_KEY", api_key),
+        ("X_API_SECRET", api_secret),
+        ("X_ACCESS_TOKEN", access_token),
+        ("X_ACCESS_TOKEN_SECRET", access_secret),
+    ] if not v]
+    if missing:
+        raise RuntimeError(f"Missing required X OAuth1 env vars: {', '.join(missing)}")
+
+    img_bytes, mime_type = download_image_bytes(image_url)
+
+    auth = OAuth1(api_key, api_secret, access_token, access_secret)
+    upload_url = "https://upload.x.com/1.1/media/upload.json"
+
+    files = {"media": ("image", img_bytes, mime_type)}
+    r = requests.post(upload_url, auth=auth, files=files, timeout=60)
+
+    print("X media upload status:", r.status_code)
+    if r.status_code >= 400:
+        raise RuntimeError(f"X media upload failed {r.status_code}")
+
+    j = r.json()
+    media_id = j.get("media_id_string") or (str(j.get("media_id")) if j.get("media_id") else "")
+    if not media_id:
+        raise RuntimeError("X media upload succeeded but no media_id returned")
+
+    return media_id
+
+def post_to_x(text: str, image_url: str = "") -> Dict[str, Any]:
     url = "https://api.x.com/2/tweets"
     access_token = get_oauth2_access_token()
+
+    payload = {"text": text}
+
+    image_url = (image_url or "").strip()
+    if image_url:
+        media_id = x_upload_media(image_url)
+        payload["media"] = {"media_ids": [media_id]}
+
     r = requests.post(
         url,
-        json={"text": text},
+        json=payload,
         headers={
             "Authorization": f"Bearer {access_token}",
             "User-Agent": USER_AGENT,
@@ -419,6 +483,7 @@ def post_to_x(text: str) -> Dict[str, Any]:
         },
         timeout=20,
     )
+
     print("X POST /2/tweets status:", r.status_code)
 
     if r.status_code >= 400:
@@ -427,7 +492,7 @@ def post_to_x(text: str) -> Dict[str, Any]:
             j = r.json()
             detail = (j.get("detail") or "").lower()
         except Exception:
-            detail = ""
+            pass
 
         if r.status_code == 403 and "duplicate" in detail:
             raise RuntimeError("X_DUPLICATE_TWEET")
@@ -435,7 +500,6 @@ def post_to_x(text: str) -> Dict[str, Any]:
         raise RuntimeError(f"X post failed {r.status_code}")
 
     return r.json()
-
 
 # ----------------------------
 # Facebook Page posting helpers
@@ -482,17 +546,21 @@ def main() -> None:
         except Exception:
             pass
 
-    if TEST_TWEET:
+          if TEST_TWEET:
         text = "Test post from Tay weather bot ✅"
-        print("TEST_TWEET enabled.")
+
+        cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
+        cr29_south = os.getenv("CR29_SOUTH_IMAGE_URL", "").strip()
+        image_url = cr29_north or cr29_south
+
         if ENABLE_X_POSTING:
-            post_to_x(text)
+            post_to_x(text, image_url=image_url)
+
         if ENABLE_FB_POSTING:
-            try:
-                post_to_facebook_page(text)
-            except RuntimeError as e:
-                print(f"Facebook skipped: {e}")
+            post_photo_to_facebook_page(text, image_url)
+
         return
+
 
     state = load_state()
     posted = set(state.get("posted_guids", []))
@@ -553,7 +621,11 @@ def main() -> None:
 
         if ENABLE_X_POSTING:
             try:
-                post_to_x(social_text)
+                cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
+                cr29_south = os.getenv("CR29_SOUTH_IMAGE_URL", "").strip()
+                image_url = cr29_north or cr29_south
+
+                post_to_x(social_text, image_url=image_url)
                 posted_anywhere = True
             except RuntimeError as e:
                 if str(e) == "X_DUPLICATE_TWEET":
@@ -563,7 +635,11 @@ def main() -> None:
 
         if ENABLE_FB_POSTING:
             try:
-                post_to_facebook_page(social_text)
+                cr29_north = os.getenv("CR29_NORTH_IMAGE_URL", "").strip()
+                cr29_south = os.getenv("CR29_SOUTH_IMAGE_URL", "").strip()
+                image_url = cr29_north or cr29_south
+
+                post_photo_to_facebook_page(social_text, image_url)
                 posted_anywhere = True
             except RuntimeError as e:
                 print(f"Facebook skipped: {e}")
