@@ -4,7 +4,7 @@
 # - Uses Environment Canada ATOM feed as the alert list (source of truth)
 # - For each entry, fetches the EC HTML alert page and extracts:
 #     * issued time (short)
-#     * first sentence after date block (headline)
+#     * headline (first meaningful sentence before "What:")
 #     * What lines (Twitter up to 2, Facebook up to 3)
 #     * When line (only if space on X; generally included on FB)
 # - Two images for both X and Facebook
@@ -49,7 +49,9 @@ TAY_COORDS_URL = os.getenv(
 TAY_ALERTS_URL = os.getenv("TAY_ALERTS_URL", "").strip()
 MORE_INFO_URL = (TAY_ALERTS_URL or TAY_COORDS_URL).strip()
 
-ALERT_FEED_URL = os.getenv("ALERT_FEED_URL", "https://weather.gc.ca/rss/battleboard/onrm94_e.xml").strip()
+ALERT_FEED_URL = os.getenv(
+    "ALERT_FEED_URL", "https://weather.gc.ca/rss/battleboard/onrm94_e.xml"
+).strip()
 DISPLAY_AREA_NAME = "Tay Township area"
 
 # Ontario 511 cameras API
@@ -87,8 +89,10 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
+
 
 def safe_int(x: Any, default: int) -> int:
     try:
@@ -96,8 +100,10 @@ def safe_int(x: Any, default: int) -> int:
     except Exception:
         return default
 
+
 def text_hash(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
 
 def load_state() -> dict:
     default = {
@@ -127,6 +133,7 @@ def load_state() -> dict:
     data.setdefault("global_last_post_ts", 0)
     return data
 
+
 def save_state(state: dict) -> None:
     state["seen_ids"] = state.get("seen_ids", [])[-5000:]
     state["posted_guids"] = state.get("posted_guids", [])[-5000:]
@@ -140,15 +147,18 @@ def save_state(state: dict) -> None:
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
+
 # ----------------------------
 # ATOM helpers
 # ----------------------------
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 
+
 def _parse_atom_dt(s: str) -> dt.datetime:
     if not s:
         return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
 
 def fetch_atom_entries(
     feed_url: str,
@@ -201,8 +211,10 @@ def fetch_atom_entries(
             raise
     raise last_err if last_err else RuntimeError("Failed to fetch ATOM feed")
 
+
 def atom_entry_guid(entry: Dict[str, Any]) -> str:
     return (entry.get("id") or entry.get("link") or entry.get("title") or "").strip()
+
 
 def emoji_from_atom_title(title_raw: str) -> str:
     t = (title_raw or "").strip().lower()
@@ -211,6 +223,7 @@ def emoji_from_atom_title(title_raw: str) -> str:
     if t.startswith("orange "):
         return "🟠"
     return "🟡"
+
 
 def clean_atom_event_name(title_raw: str) -> str:
     """
@@ -224,6 +237,7 @@ def clean_atom_event_name(title_raw: str) -> str:
     t = t.replace(", Midland - Coldwater - Orr Lake", "").strip()
     t = t.replace("Midland - Coldwater - Orr Lake", "").strip()
     return t or "Weather alert"
+
 
 # ----------------------------
 # EC HTML parsing helpers
@@ -248,14 +262,13 @@ def _html_to_text(html: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+
 def fetch_ec_page_details(url: str) -> Dict[str, Any]:
     """
-    Returns:
-      issued_raw: "6:58 PM EST Thursday 1 January 2026"
-      issued_short: "Issued Jan 1 6:58p"
-      headline: "Snow squalls expected to continue tonight."
-      what_lines: ["Local snowfall amounts of 20 to 30 cm.", "Reduced visibility ..."]
-      when_line: "Continuing through Friday morning."
+    STRICT EC parser:
+    - Only parses the alert body AFTER the "* * *" divider.
+    - If the divider can't be found, it returns empty headline/what/when
+      to prevent navbar/UI junk (e.g., "Edit My Profile") from ever appearing.
     """
     if not url:
         return {}
@@ -264,7 +277,9 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
     r.raise_for_status()
     text = _html_to_text(r.text)
 
-    # Issued line (raw)
+    # ----------------------------
+    # Issued line (raw/short)
+    # ----------------------------
     issued_raw = ""
     m = re.search(
         r"\b(\d{1,2}:\d{2}\s*(?:AM|PM)\s*EST\s+\w+\s+\d{1,2}\s+\w+\s+\d{4})\b",
@@ -276,7 +291,6 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
 
     issued_short = ""
     if issued_raw:
-        # Parse like: "6:58 PM EST Thursday 1 January 2026"
         m2 = re.search(
             r"(\d{1,2}):(\d{2})\s*(AM|PM)\s*EST\s+\w+\s+(\d{1,2})\s+(\w+)\s+(\d{4})",
             issued_raw,
@@ -288,7 +302,7 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             ap = m2.group(3).lower()
             day = int(m2.group(4))
             mon_name = m2.group(5)
-            # map month name to short
+
             mon_map = {
                 "january": "Jan",
                 "february": "Feb",
@@ -306,18 +320,41 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             mon = mon_map.get(mon_name.strip().lower(), mon_name[:3].title())
             issued_short = f"Issued {mon} {day} {hh}:{mm}{'a' if ap=='am' else 'p'}"
 
-    # Find the first narrative block after the separator "* * *"
+    # ----------------------------
+    # Narrative extraction (STRICT)
+    # Only parse AFTER the "* * *" divider.
+    # ----------------------------
     narrative = ""
-    parts = re.split(r"\n\*\s*\*\s*\*\s*\n", text)
-    if len(parts) >= 2:
-        narrative = parts[1].strip()
-    else:
-        # fallback: find first occurrence of "What:" and take a window before it
-        idx = text.lower().find("what:")
-        if idx != -1:
-            narrative = text[max(0, idx - 400) : idx + 1200]
+    m_sep = re.search(r"\*\s*\*\s*\*", text)
+    if m_sep:
+        narrative = text[m_sep.end():].strip()
 
-    # Headline = first sentence up to "What:" (or first meaningful line)
+    # If divider isn't found, fail cleanly (prevents navbar/profile/shortcuts text)
+    if not narrative:
+        return {
+            "issued_raw": issued_raw,
+            "issued_short": issued_short,
+            "headline": "",
+            "what_lines": [],
+            "when_line": "",
+        }
+
+    # ----------------------------
+    # Extract What and When blocks from narrative
+    # ----------------------------
+    what_block = ""
+    when_block = ""
+    if "What:" in narrative:
+        after_what = narrative.split("What:", 1)[1]
+        if "When:" in after_what:
+            what_block, after_when = after_what.split("When:", 1)
+            when_block = after_when
+        else:
+            what_block = after_what
+
+    # ----------------------------
+    # Headline = first meaningful line before "What:" (no fragments)
+    # ----------------------------
     headline = ""
     before_what = narrative
     if "What:" in before_what:
@@ -333,8 +370,10 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             # Reject fragments like "formation."
             if len(line.split()) < 4:
                 return True
+            # EC headline sentences are sentence-case; fragments often are not
             if not line[0].isupper():
                 return True
+            # Reject very short lines
             if len(line) < 20:
                 return True
             return False
@@ -345,29 +384,17 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             headline = ln
             break
 
-    # Ensure punctuation
     if headline and not headline.endswith("."):
         headline += "."
 
-    # Extract What and When blocks from narrative
-    what_block = ""
-    when_block = ""
-    if "What:" in narrative:
-        after_what = narrative.split("What:", 1)[1]
-        if "When:" in after_what:
-            what_block, after_when = after_what.split("When:", 1)
-            when_block = after_when
-        else:
-            what_block = after_what
-
-    # What lines: split by sentence, keep short sentences
+    # ----------------------------
+    # What lines: split by sentence
+    # ----------------------------
     what_lines: List[str] = []
     if what_block:
-        # stop before "Additional information:" if present
         what_block = what_block.split("Additional information:", 1)[0]
         what_block = re.sub(r"\s+", " ", what_block).strip()
 
-        # Protect a.m./p.m. from splitting
         protected = re.sub(
             r"\b([ap])\.m\.\b",
             lambda m: f"{m.group(1).upper()}M_TOKEN",
@@ -381,19 +408,14 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
                 s += "."
             what_lines.append(s)
 
-    # Defensive: remove any UI label sentences if they show up
-    what_lines = [
-        w for w in what_lines
-        if normalize(w) not in {"alert", "alerts", "alert.", "alerts."}
-        and "edit my profile" not in normalize(w)
-        and "my weather profile" not in normalize(w)
-    ]
-
+    # ----------------------------
     # When line: first sentence only
+    # ----------------------------
     when_line = ""
     if when_block:
         when_block = when_block.split("Additional information:", 1)[0]
         when_block = re.sub(r"\s+", " ", when_block).strip()
+
         protected = re.sub(
             r"\b([ap])\.m\.\b",
             lambda m: f"{m.group(1).upper()}M_TOKEN",
@@ -415,6 +437,7 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
         "when_line": when_line,
     }
 
+
 # ----------------------------
 # Social text builders
 # ----------------------------
@@ -429,18 +452,16 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
     # Warm, short, no Oxford commas
     care = "Please take care, travel only if needed and check on neighbours who may need support."
 
-    # Build with optional components, then trim to 280 preserving hashtags
     base_lines: List[str] = [header]
     if headline:
         base_lines.append(headline)
 
-    # Prefer 2 What lines
     chosen_what = [w for w in what_lines if w][:X_WHAT_MAX]
 
     def compose(include_when: bool, include_care: bool, what_count: int) -> str:
         lines = list(base_lines)
         if what_count > 0:
-            lines.append("")  # spacer
+            lines.append("")
             lines.extend(chosen_what[:what_count])
 
         if include_when and when_line:
@@ -492,6 +513,7 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
     head = head[:room].rstrip()
     return (head + "\n" + tail).strip()
 
+
 def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
     header = f"{emoji} {event_name} in Tay Township".strip()
 
@@ -535,8 +557,9 @@ def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
         cleaned.append(ln)
     return "\n".join(cleaned).strip()
 
+
 # ----------------------------
-# RSS helpers (unchanged)
+# RSS helpers
 # ----------------------------
 def ensure_rss_exists() -> None:
     if os.path.exists(RSS_PATH):
@@ -552,6 +575,7 @@ def ensure_rss_exists() -> None:
 
     ET.ElementTree(rss).write(RSS_PATH, encoding="utf-8", xml_declaration=True)
 
+
 def load_rss_tree() -> Tuple[ET.ElementTree, ET.Element]:
     ensure_rss_exists()
     tree = ET.parse(RSS_PATH)
@@ -561,6 +585,7 @@ def load_rss_tree() -> Tuple[ET.ElementTree, ET.Element]:
         raise RuntimeError("RSS file missing <channel>")
     return tree, channel
 
+
 def rss_item_exists(channel: ET.Element, guid_text: str) -> bool:
     for item in channel.findall("item"):
         guid = item.find("guid")
@@ -568,7 +593,15 @@ def rss_item_exists(channel: ET.Element, guid_text: str) -> bool:
             return True
     return False
 
-def add_rss_item(channel: ET.Element, title: str, link: str, guid: str, pub_date: str, description: str) -> None:
+
+def add_rss_item(
+    channel: ET.Element,
+    title: str,
+    link: str,
+    guid: str,
+    pub_date: str,
+    description: str,
+) -> None:
     item = ET.Element("item")
     ET.SubElement(item, "title").text = title
     ET.SubElement(item, "link").text = link
@@ -584,6 +617,7 @@ def add_rss_item(channel: ET.Element, title: str, link: str, guid: str, pub_date
             insert_index = i + 1
     channel.insert(insert_index, item)
 
+
 def trim_rss_items(channel: ET.Element, max_items: int) -> None:
     items = channel.findall("item")
     if len(items) <= max_items:
@@ -591,14 +625,16 @@ def trim_rss_items(channel: ET.Element, max_items: int) -> None:
     for item in items[max_items:]:
         channel.remove(item)
 
+
 MAX_RSS_ITEMS = 25
 
 # ----------------------------
-# Cooldown logic (unchanged)
+# Cooldown logic
 # ----------------------------
 def group_key_for_cooldown(area_name: str, kind: str) -> str:
     raw = f"{normalize(area_name)}|{normalize(kind)}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
 
 def cooldown_allows_post(state: Dict[str, Any], area_name: str, kind: str = "alert") -> Tuple[bool, str]:
     now_ts = int(time.time())
@@ -617,6 +653,7 @@ def cooldown_allows_post(state: Dict[str, Any], area_name: str, kind: str = "ale
 
     return True, "OK"
 
+
 def mark_posted(state: Dict[str, Any], area_name: str, kind: str = "alert") -> None:
     now_ts = int(time.time())
     key = group_key_for_cooldown(area_name, kind)
@@ -624,10 +661,12 @@ def mark_posted(state: Dict[str, Any], area_name: str, kind: str = "alert") -> N
     state["cooldowns"][key] = now_ts
     state["global_last_post_ts"] = now_ts
 
+
 # ----------------------------
-# Ontario 511 camera resolver (unchanged)
+# Ontario 511 camera resolver
 # ----------------------------
 _ON511_CAMERAS_CACHE: Optional[List[Dict[str, Any]]] = None
+
 
 def is_image_url(url: str) -> bool:
     url = (url or "").strip()
@@ -635,7 +674,12 @@ def is_image_url(url: str) -> bool:
         return False
 
     try:
-        r = requests.head(url, allow_redirects=True, headers={"User-Agent": USER_AGENT}, timeout=(5, 15))
+        r = requests.head(
+            url,
+            allow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=(5, 15),
+        )
         ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if r.status_code < 400 and ct.startswith("image/"):
             return True
@@ -643,11 +687,17 @@ def is_image_url(url: str) -> bool:
         pass
 
     try:
-        r = requests.get(url, allow_redirects=True, headers={"User-Agent": USER_AGENT}, timeout=(5, 20))
+        r = requests.get(
+            url,
+            allow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+            timeout=(5, 20),
+        )
         ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         return r.status_code < 400 and ct.startswith("image/")
     except Exception:
         return False
+
 
 def fetch_on511_cameras() -> List[Dict[str, Any]]:
     global _ON511_CAMERAS_CACHE
@@ -662,6 +712,7 @@ def fetch_on511_cameras() -> List[Dict[str, Any]]:
 
     _ON511_CAMERAS_CACHE = data
     return data
+
 
 def resolve_on511_views_by_keyword(keyword: str) -> List[Dict[str, Any]]:
     kw = normalize(keyword)
@@ -678,6 +729,7 @@ def resolve_on511_views_by_keyword(keyword: str) -> List[Dict[str, Any]]:
                     if isinstance(v, dict):
                         out.append(v)
     return out
+
 
 def pick_north_south_view_urls(views: List[Dict[str, Any]]) -> Tuple[str, str]:
     north = ""
@@ -714,6 +766,7 @@ def pick_north_south_view_urls(views: List[Dict[str, Any]]) -> Tuple[str, str]:
 
     return north, south
 
+
 def resolve_cr29_image_urls() -> List[str]:
     north_env = (os.getenv("CR29_NORTH_IMAGE_URL") or "").strip()
     south_env = (os.getenv("CR29_SOUTH_IMAGE_URL") or "").strip()
@@ -737,8 +790,9 @@ def resolve_cr29_image_urls() -> List[str]:
 
     return urls[:2]
 
+
 # ----------------------------
-# X OAuth2 (posting) helpers (unchanged)
+# X OAuth2 (posting) helpers
 # ----------------------------
 def write_rotated_refresh_token(new_refresh: str) -> None:
     new_refresh = (new_refresh or "").strip()
@@ -747,16 +801,21 @@ def write_rotated_refresh_token(new_refresh: str) -> None:
     with open(ROTATED_X_REFRESH_TOKEN_PATH, "w", encoding="utf-8") as f:
         f.write(new_refresh)
 
+
 def get_oauth2_access_token() -> str:
     client_id = os.getenv("X_CLIENT_ID", "").strip()
     client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
     refresh_token = os.getenv("X_REFRESH_TOKEN", "").strip()
 
-    missing = [k for k, v in [
-        ("X_CLIENT_ID", client_id),
-        ("X_CLIENT_SECRET", client_secret),
-        ("X_REFRESH_TOKEN", refresh_token),
-    ] if not v]
+    missing = [
+        k
+        for k, v in [
+            ("X_CLIENT_ID", client_id),
+            ("X_CLIENT_SECRET", client_secret),
+            ("X_REFRESH_TOKEN", refresh_token),
+        ]
+        if not v
+    ]
     if missing:
         raise RuntimeError(f"Missing required X env vars: {', '.join(missing)}")
 
@@ -788,15 +847,21 @@ def get_oauth2_access_token() -> str:
 
     return access
 
+
 # ----------------------------
-# X media upload helpers (OAuth 1.0a) (unchanged)
+# X media upload helpers (OAuth 1.0a)
 # ----------------------------
 def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
     image_url = (image_url or "").strip()
     if not image_url:
         raise RuntimeError("No image_url provided")
 
-    r = requests.get(image_url, headers={"User-Agent": USER_AGENT}, timeout=(10, 30), allow_redirects=True)
+    r = requests.get(
+        image_url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=(10, 30),
+        allow_redirects=True,
+    )
     r.raise_for_status()
 
     content_type = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
@@ -805,18 +870,23 @@ def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
 
     return r.content, content_type
 
+
 def x_upload_media(image_url: str) -> str:
     api_key = os.getenv("X_API_KEY", "").strip()
     api_secret = os.getenv("X_API_SECRET", "").strip()
     access_token = os.getenv("X_ACCESS_TOKEN", "").strip()
     access_secret = os.getenv("X_ACCESS_TOKEN_SECRET", "").strip()
 
-    missing = [k for k, v in [
-        ("X_API_KEY", api_key),
-        ("X_API_SECRET", api_secret),
-        ("X_ACCESS_TOKEN", access_token),
-        ("X_ACCESS_TOKEN_SECRET", access_secret),
-    ] if not v]
+    missing = [
+        k
+        for k, v in [
+            ("X_API_KEY", api_key),
+            ("X_API_SECRET", api_secret),
+            ("X_ACCESS_TOKEN", access_token),
+            ("X_ACCESS_TOKEN_SECRET", access_secret),
+        ]
+        if not v
+    ]
     if missing:
         raise RuntimeError(f"Missing required X OAuth1 env vars: {', '.join(missing)}")
 
@@ -838,6 +908,7 @@ def x_upload_media(image_url: str) -> str:
         raise RuntimeError("X media upload succeeded but no media_id returned")
 
     return media_id
+
 
 def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     url = "https://api.x.com/2/tweets"
@@ -884,8 +955,9 @@ def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> Dict[str, An
 
     return r.json()
 
+
 # ----------------------------
-# Facebook posting helpers (unchanged)
+# Facebook posting helpers
 # ----------------------------
 def post_to_facebook_page(message: str) -> Dict[str, Any]:
     page_id = os.getenv("FB_PAGE_ID", "").strip()
@@ -899,6 +971,7 @@ def post_to_facebook_page(message: str) -> Dict[str, Any]:
     if r.status_code >= 400:
         raise RuntimeError(f"Facebook feed post failed {r.status_code}")
     return r.json()
+
 
 def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     page_id = os.getenv("FB_PAGE_ID", "").strip()
@@ -918,6 +991,7 @@ def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     if r.status_code >= 400:
         raise RuntimeError(f"Facebook photo post failed {r.status_code}")
     return r.json()
+
 
 def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[str, Any]:
     image_urls = [u for u in (image_urls or []) if (u or "").strip()]
@@ -968,8 +1042,9 @@ def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[
 
     return r.json()
 
+
 # ----------------------------
-# RSS description (unchanged-ish)
+# RSS description
 # ----------------------------
 def build_rss_description_from_atom(entry: Dict[str, Any]) -> str:
     title = (entry.get("title") or "").strip()
@@ -982,6 +1057,7 @@ def build_rss_description_from_atom(entry: Dict[str, Any]) -> str:
     if official:
         bits.append(f"Official alert details: {official}")
     return "\n".join(bits)
+
 
 # ----------------------------
 # Main
@@ -1045,11 +1121,10 @@ def main() -> None:
             print("Social skipped:", reason)
             continue
 
-        # Build new-style social text by parsing EC HTML page
         emoji = emoji_from_atom_title(entry.get("title") or "")
         event_name = clean_atom_event_name(entry.get("title") or "")
 
-        details = {}
+        details: Dict[str, Any] = {}
         try:
             details = fetch_ec_page_details((entry.get("link") or "").strip())
         except Exception as e:
@@ -1114,6 +1189,7 @@ def main() -> None:
         f"social_posted={social_posted}",
         f"social_skipped_cooldown={social_skipped_cooldown}",
     )
+
 
 if __name__ == "__main__":
     main()
