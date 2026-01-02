@@ -283,16 +283,24 @@ def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
 
     # Pull first “timing” sentence out so it can be its own line (no WHAT/WHEN labels)
     timing = ""
-    sentences = [s.strip() for s in re.split(r"\.(\s+|$)", summary) if s and s.strip() and s.strip() != " "]
-    # Rebuild sentence list correctly (re.split above keeps separators sometimes); do a simpler split:
-    sentences = [s.strip() for s in summary.split(".") if s.strip()]
+    # Prefer splitting by lines first (EC summaries often use line breaks),
+    # then do a light sentence split that won't break p.m./a.m. as badly.
+    chunks: List[str] = []
+    for line in summary.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+    chunks.extend([s.strip() for s in re.split(r"(?<!\b[ap])\.(?:\s+|$)", line, flags=re.I) if s.strip()])
+
+sentences = chunks
+
 
     keep: List[str] = []
     for s in sentences:
         s_low = s.lower()
         if not timing and (
             "conditions are expected" in s_low
-            or "expected" in s_low
+            or "expected" in s_low and ("conditions" in s_low or "starting" in s_low or "ending" in s_low or "continuing" in s_low)
             or "this evening" in s_low
             or "tonight" in s_low
             or "today" in s_low
