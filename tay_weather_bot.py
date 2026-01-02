@@ -281,16 +281,19 @@ def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
     # Remove any leading "Issued at ..." line if present
     summary = re.sub(r"^\s*issued\s+at.*?(\n+|$)", "", summary, flags=re.I)
 
-    # Pull first “timing” sentence out so it can be its own line (no WHAT/WHEN labels)
+        # Pull first “timing” sentence out so it can be its own line (no WHAT/WHEN labels)
     timing = ""
+
     # Prefer splitting by lines first (EC summaries often use line breaks),
     # then do a light sentence split that won't break p.m./a.m. as badly.
-    chunks: List[str] = []
+    sentences: List[str] = []
     for line in summary.splitlines():
         line = line.strip()
         if not line:
             continue
-    chunks.extend([s.strip() for s in re.split(r"(?<!\b[ap])\.(?:\s+|$)", line, flags=re.I) if s.strip()])
+
+        parts = re.split(r"(?<!\b[ap])\.(?:\s+|$)", line, flags=re.I)
+        sentences.extend([p.strip() for p in parts if p.strip()])
 
 sentences = chunks
 
