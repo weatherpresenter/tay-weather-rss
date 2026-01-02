@@ -1,37 +1,14 @@
-# tay_weather_bot.py
+# tay_weather_bot_v2.py
 #
-# Tay Township Weather Bot
-# - Pulls Environment Canada alerts from regional ATOM feed (source of truth)
-# - Writes RSS feed: tay-weather.xml
-# - Posts to X automatically (OAuth 2.0 refresh token)
-# - Uploads media to X via OAuth 1.0a user context (required for media upload)
-# - Posts to Facebook Page automatically (Page access token), supports photo carousels
-# - Supports cooldowns + dedupe
-#
-# REQUIRED GitHub Secrets (X OAuth 2.0 posting):
-#   X_CLIENT_ID
-#   X_CLIENT_SECRET
-#   X_REFRESH_TOKEN
-#
-# REQUIRED GitHub Secrets (X media upload via OAuth 1.0a user context):
-#   X_API_KEY
-#   X_API_SECRET
-#   X_ACCESS_TOKEN
-#   X_ACCESS_TOKEN_SECRET
-#
-# REQUIRED GitHub Secrets (Facebook Page posting):
-#   FB_PAGE_ID
-#   FB_PAGE_ACCESS_TOKEN
-#
-# OPTIONAL workflow env vars:
-#   ENABLE_X_POSTING=true|false
-#   ENABLE_FB_POSTING=true|false
-#   TEST_TWEET=true
-#   ALERT_FEED_URL=<ATOM feed url>
-#   TAY_COORDS_URL=<coords link>
-#   CR29_NORTH_IMAGE_URL=<direct image url OR https://511on.ca/map/Cctv/<id>>
-#   CR29_SOUTH_IMAGE_URL=<direct image url OR https://511on.ca/map/Cctv/<id>>
-#   ON511_CAMERA_KEYWORD=<default: CR-29>
+# Tay Township Weather Bot (v2 message builder)
+# - Uses Environment Canada ATOM feed as the alert list (source of truth)
+# - For each entry, fetches the EC HTML alert page and extracts:
+#     * issued time (short)
+#     * first sentence after date block (headline)
+#     * What lines (Twitter up to 2, Facebook up to 3)
+#     * When line (only if space on X; generally included on FB)
+# - Two images for both X and Facebook
+# - X: hard 280 chars including spaces, keep hashtags, no Oxford commas, Canadian spelling
 #
 import base64
 import datetime as dt
@@ -47,14 +24,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests_oauthlib import OAuth1
 
-
 # ----------------------------
 # Feature toggles
 # ----------------------------
 ENABLE_X_POSTING = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
 ENABLE_FB_POSTING = os.getenv("ENABLE_FB_POSTING", "false").lower() == "true"
 TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
-
 
 # ----------------------------
 # Paths
@@ -63,17 +38,16 @@ STATE_PATH = "state.json"
 RSS_PATH = "tay-weather.xml"
 ROTATED_X_REFRESH_TOKEN_PATH = "x_refresh_token_rotated.txt"
 
-USER_AGENT = "tay-weather-rss-bot/1.1"
+USER_AGENT = "tay-weather-rss-bot/2.0"
 
-# Public “more info” URL
-# Prefer your GitHub Pages Tay page (tay/index.html), fall back to WeatherCAN coords page
+# Public “more info” URL (prefer GitHub page)
 TAY_COORDS_URL = os.getenv(
     "TAY_COORDS_URL",
     "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768",
 ).strip()
 
-TAY_ALERTS_URL = os.getenv("TAY_ALERTS_URL", "").strip()  # e.g. https://<your-pages-site>/tay/
-MORE_INFO_URL = TAY_ALERTS_URL or TAY_COORDS_URL
+TAY_ALERTS_URL = os.getenv("TAY_ALERTS_URL", "").strip()
+MORE_INFO_URL = (TAY_ALERTS_URL or TAY_COORDS_URL).strip()
 
 ALERT_FEED_URL = os.getenv("ALERT_FEED_URL", "https://weather.gc.ca/rss/battleboard/onrm94_e.xml").strip()
 DISPLAY_AREA_NAME = "Tay Township area"
@@ -81,6 +55,12 @@ DISPLAY_AREA_NAME = "Tay Township area"
 # Ontario 511 cameras API
 ON511_CAMERAS_API = "https://511on.ca/api/v2/get/cameras"
 ON511_CAMERA_KEYWORD = os.getenv("ON511_CAMERA_KEYWORD", "CR-29").strip() or "CR-29"
+
+# How many "What" lines
+X_WHAT_MAX = 2
+FB_WHAT_MAX = 3
+
+HASHTAGS = "#TayTownship #ONStorm"
 
 # ----------------------------
 # Cooldown policy
@@ -96,11 +76,9 @@ COOLDOWN_MINUTES = {
 }
 GLOBAL_COOLDOWN_MINUTES = 5
 
-
 # ----------------------------
 # Generic helpers
 # ----------------------------
-
 def normalize(s: str) -> str:
     if not s:
         return ""
@@ -109,10 +87,8 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
-
 
 def safe_int(x: Any, default: int) -> int:
     try:
@@ -120,10 +96,8 @@ def safe_int(x: Any, default: int) -> int:
     except Exception:
         return default
 
-
 def text_hash(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
 
 def load_state() -> dict:
     default = {
@@ -153,7 +127,6 @@ def load_state() -> dict:
     data.setdefault("global_last_post_ts", 0)
     return data
 
-
 def save_state(state: dict) -> None:
     state["seen_ids"] = state.get("seen_ids", [])[-5000:]
     state["posted_guids"] = state.get("posted_guids", [])[-5000:]
@@ -167,18 +140,15 @@ def save_state(state: dict) -> None:
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-
 # ----------------------------
 # ATOM helpers
 # ----------------------------
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 
-
 def _parse_atom_dt(s: str) -> dt.datetime:
     if not s:
         return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-
 
 def fetch_atom_entries(
     feed_url: str,
@@ -231,156 +201,297 @@ def fetch_atom_entries(
             raise
     raise last_err if last_err else RuntimeError("Failed to fetch ATOM feed")
 
-
-def atom_title_for_tay(title: str) -> str:
-    if not title:
-        return title
-    t = title.replace(", Midland - Coldwater - Orr Lake", f" ({DISPLAY_AREA_NAME})")
-    t = t.replace("Midland - Coldwater - Orr Lake", DISPLAY_AREA_NAME)
-    return t
-
-
 def atom_entry_guid(entry: Dict[str, Any]) -> str:
     return (entry.get("id") or entry.get("link") or entry.get("title") or "").strip()
 
+def emoji_from_atom_title(title_raw: str) -> str:
+    t = (title_raw or "").strip().lower()
+    if t.startswith("red "):
+        return "🔴"
+    if t.startswith("orange "):
+        return "🟠"
+    return "🟡"
 
-def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
-    title_raw = (entry.get("title") or "").strip()
-    summary_raw = (entry.get("summary") or "").strip()
+def clean_atom_event_name(title_raw: str) -> str:
+    """
+    From ATOM title like:
+      "Yellow Snow Squall Warning, Midland - Coldwater - Orr Lake"
+    produce:
+      "Snow Squall Warning"
+    """
+    t = (title_raw or "").strip()
+    t = re.sub(r"^(yellow|orange|red)\s+", "", t, flags=re.I).strip()
+    t = t.replace(", Midland - Coldwater - Orr Lake", "").strip()
+    t = t.replace("Midland - Coldwater - Orr Lake", "").strip()
+    return t or "Weather alert"
 
-    # ----------------------------
-    # 1) Colour circle from EC colour-coded prefix (YELLOW/ORANGE/RED)
-    # ----------------------------
-    t_low = title_raw.lower()
-    if t_low.startswith("red "):
-        circle = "🔴"
-    elif t_low.startswith("orange "):
-        circle = "🟠"
-    else:
-        circle = "🟡"
+# ----------------------------
+# EC HTML parsing helpers
+# ----------------------------
+def _html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    # add newlines for common block boundaries before stripping tags
+    html = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    html = re.sub(r"(?i)</p\s*>", "\n", html)
+    html = re.sub(r"(?i)</div\s*>", "\n", html)
+    html = re.sub(r"(?i)</li\s*>", "\n", html)
+    # strip scripts/styles
+    html = re.sub(r"(?is)<script.*?>.*?</script>", "", html)
+    html = re.sub(r"(?is)<style.*?>.*?</style>", "", html)
+    # strip tags
+    text = re.sub(r"(?s)<.*?>", "", html)
+    text = text.replace("\xa0", " ")
+    # normalize whitespace but keep line breaks
+    text = re.sub(r"\r", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    # Remove ONLY the colour word, keep Weather Canada event wording (Warning/Watch/Advisory)
-    title = re.sub(r"^(yellow|orange|red)\s+", "", title_raw, flags=re.I).strip()
+def fetch_ec_page_details(url: str) -> Dict[str, Any]:
+    """
+    Returns:
+      issued_raw: "6:58 PM EST Thursday 1 January 2026"
+      issued_short: "Issued Jan 1 6:58p"
+      headline: "Snow squalls expected to continue tonight."
+      what_lines: ["Local snowfall amounts of 20 to 30 cm.", "Reduced visibility ..."]
+      when_line: "Continuing through Friday morning."
+    """
+    if not url:
+        return {}
 
-    # Replace forecast-region wording with Tay Township (no parentheses, no “area”)
-    title = title.replace(", Midland - Coldwater - Orr Lake", " in Tay Township")
-    title = title.replace("Midland - Coldwater - Orr Lake", "Tay Township")
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(8, 25))
+    r.raise_for_status()
+    text = _html_to_text(r.text)
 
-    
-    # Conversational opener, but keep the official event wording in the body
-    event_for_header = re.sub(r"\bWarning\b|\bWatch\b|\bAdvisory\b", "conditions", title, flags=re.I).strip()
-    header = f"{circle} {event_for_header}"
-    if "tay township" not in header.lower():
-        header = f"{circle} {event_for_header} in Tay Township"
-
-    # ----------------------------
-    # 2) Use Weather Canada phrasing from summary, but avoid duplicated issued/timing lines
-    # ----------------------------
-    summary = summary_raw
-
-    # Remove any leading "Issued at ..." line if present
-    summary = re.sub(r"^\s*issued\s+at.*?(\n+|$)", "", summary, flags=re.I)
-
-    # Pull first “timing” sentence out so it can be its own line (no WHAT/WHEN labels)
-    timing = ""
-
-    # Prefer splitting by lines first (EC summaries often use line breaks)
-    chunks: List[str] = []
-
-    # Protect a.m./p.m. so we don’t split inside them
-    protected = re.sub(
-        r"\b([ap])\.m\.\b",
-        lambda m: f"{m.group(1).upper()}M_TOKEN",
-        summary,
+    # Issued line (raw)
+    issued_raw = ""
+    m = re.search(
+        r"\b(\d{1,2}:\d{2}\s*(?:AM|PM)\s*EST\s+\w+\s+\d{1,2}\s+\w+\s+\d{4})\b",
+        text,
         flags=re.I,
     )
+    if m:
+        issued_raw = m.group(1).strip()
 
-    for line in protected.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    issued_short = ""
+    if issued_raw:
+        # Parse like: "6:58 PM EST Thursday 1 January 2026"
+        m2 = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)\s*EST\s+\w+\s+(\d{1,2})\s+(\w+)\s+(\d{4})", issued_raw, flags=re.I)
+        if m2:
+            hh = int(m2.group(1))
+            mm = m2.group(2)
+            ap = m2.group(3).lower()
+            day = int(m2.group(4))
+            mon_name = m2.group(5)
+            # map month name to short
+            mon_map = {
+                "january":"Jan","february":"Feb","march":"Mar","april":"Apr","may":"May","june":"Jun",
+                "july":"Jul","august":"Aug","september":"Sep","october":"Oct","november":"Nov","december":"Dec",
+            }
+            mon = mon_map.get(mon_name.strip().lower(), mon_name[:3].title())
+            # 12-hour already, remove leading zero by int conversion
+            issued_short = f"Issued {mon} {day} {hh}:{mm}{'a' if ap=='am' else 'p'}"
 
-    # Split into sentences on periods, then restore a.m./p.m.
-    parts = [p.strip() for p in line.split(".") if p.strip()]
-    for p in parts:
-        p = p.replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
-        chunks.append(p)
+    # Find the first narrative block after the separator "* * *"
+    # In practice, the page has a literal "* * *" line before the narrative.
+    narrative = ""
+    parts = re.split(r"\n\*\s*\*\s*\*\s*\n", text)
+    if len(parts) >= 2:
+        # narrative begins immediately after separator
+        narrative = parts[1].strip()
+    else:
+        # fallback: find first occurrence of "What:" and take a window before it
+        idx = text.lower().find("what:")
+        if idx != -1:
+            narrative = text[idx - 400 : idx + 1200]
 
-    sentences = chunks
+    # Headline = first sentence up to "What:" (or first line)
+    headline = ""
+    before_what = narrative
+    if "What:" in before_what:
+        before_what = before_what.split("What:", 1)[0]
+    headline = before_what.strip().splitlines()[0].strip() if before_what.strip() else ""
+    # Ensure punctuation
+    if headline and not headline.endswith("."):
+        headline += "."
 
+    # Extract What and When blocks from narrative
+    what_block = ""
+    when_block = ""
+    if "What:" in narrative:
+        after_what = narrative.split("What:", 1)[1]
+        if "When:" in after_what:
+            what_block, after_when = after_what.split("When:", 1)
+            when_block = after_when
+        else:
+            what_block = after_what
 
+    # What lines: split by sentence, keep short sentences
+    what_lines: List[str] = []
+    if what_block:
+        # stop before "Additional information:" if present
+        what_block = what_block.split("Additional information:", 1)[0]
+        what_block = re.sub(r"\s+", " ", what_block).strip()
 
-    keep: List[str] = []
-    for s in sentences:
-        s_low = s.lower()
-        if not timing and (
-            "conditions are expected" in s_low
-            or "expected" in s_low and ("conditions" in s_low or "starting" in s_low or "ending" in s_low or "continuing" in s_low)
-            or "this evening" in s_low
-            or "tonight" in s_low
-            or "today" in s_low
-            or "overnight" in s_low
-            or "into" in s_low and ("morning" in s_low or "afternoon" in s_low or "evening" in s_low)
-        ):
-            timing = s.strip()
-            continue
-        keep.append(s.strip())
+        # Protect a.m./p.m. from splitting
+        protected = re.sub(r"\b([ap])\.m\.\b", lambda m: f"{m.group(1).upper()}M_TOKEN", what_block, flags=re.I)
+        raw_sents = [s.strip() for s in protected.split(".") if s.strip()]
+        for s in raw_sents:
+            s = s.replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
+            if not s.endswith("."):
+                s += "."
+            what_lines.append(s)
 
-    # Keep the first 2–3 sentences for impacts so it stays social-friendly
-    impacts = ". ".join(keep[:3]).strip()
-    if impacts and not impacts.endswith("."):
-        impacts += "."
+    # When line: first sentence only
+    when_line = ""
+    if when_block:
+        when_block = when_block.split("Additional information:", 1)[0]
+        when_block = re.sub(r"\s+", " ", when_block).strip()
+        protected = re.sub(r"\b([ap])\.m\.\b", lambda m: f"{m.group(1).upper()}M_TOKEN", when_block, flags=re.I)
+        sents = [s.strip() for s in protected.split(".") if s.strip()]
+        if sents:
+            s = sents[0].replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
+            if not s.endswith("."):
+                s += "."
+            when_line = s
 
-    if timing and not timing.endswith("."):
-        timing += "."
-
-    # ----------------------------
-    # 3) Issued time at the end (Canadian style, no Oxford commas)
-    # ----------------------------
-    issued_dt = entry.get("updated_dt")
-    issued_str = ""
-    if isinstance(issued_dt, dt.datetime):
-        # Example: "Issued Jan 1, 6:58 p.m."
-        issued_str = issued_dt.strftime("Issued %b %-d, %-I:%M %p")
-        issued_str = issued_str.replace("AM", "a.m.").replace("PM", "p.m.")
-
-    care = "Please take care, avoid unnecessary travel and check on neighbours who may need support."
-
-    parts = [header, ""]
-    if impacts:
-        parts.append(impacts)
-    if timing:
-        parts.extend(["", timing])
-    parts.extend(["", care, "", f"More information: {MORE_INFO_URL}"])
-    if issued_str:
-        parts.extend(["", issued_str])
-    parts.append("#TayTownship #ONStorm")
-
-    text = "\n".join([p for p in parts if p]).strip()
-
-    # X hard limit
-    if len(text) > 280:
-        text = text[:277].rstrip() + "…"
-
-    return text
-
-def build_rss_description_from_atom(entry: Dict[str, Any]) -> str:
-    title = atom_title_for_tay((entry.get("title") or "").strip())
-    issued = (entry.get("summary") or "").strip()
-    official = (entry.get("link") or "").strip()
-    bits = [title]
-    if issued:
-        bits.append(issued)
-    bits.append(f"More info (Tay Township): {MORE_INFO_URL}")
-    if official:
-        bits.append(f"Official alert details: {official}")
-    return "\n".join(bits)
-
+    return {
+        "issued_raw": issued_raw,
+        "issued_short": issued_short,
+        "headline": headline,
+        "what_lines": what_lines,
+        "when_line": when_line,
+    }
 
 # ----------------------------
-# RSS helpers
+# Social text builders
 # ----------------------------
+def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
+    header = f"{emoji} {event_name} in Tay Township".strip()
 
+    headline = (details.get("headline") or "").strip()
+    what_lines = details.get("what_lines") or []
+    when_line = (details.get("when_line") or "").strip()
+    issued_short = (details.get("issued_short") or "").strip()
+
+    # Warm, short, no Oxford commas
+    care = "Please take care, travel only if needed and check on neighbours who may need support."
+
+    # Build with optional components, then trim to 280 preserving hashtags
+    base_lines: List[str] = [header]
+    if headline:
+        base_lines.append(headline)
+
+    # Prefer 2 What lines
+    chosen_what = [w for w in what_lines if w][:X_WHAT_MAX]
+
+    # Compose candidate blocks in order of preference
+    def compose(include_when: bool, include_care: bool, what_count: int) -> str:
+        lines = list(base_lines)
+        if what_count > 0:
+            lines.append("")  # spacer
+            lines.extend(chosen_what[:what_count])
+
+        if include_when and when_line:
+            lines.append("")
+            lines.append(f"When: {when_line}".replace("When: When:", "When:").strip())
+
+        if include_care:
+            lines.append("")
+            lines.append(care)
+
+        lines.append(f"More: {MORE_INFO_URL}")
+        if issued_short:
+            lines.append(issued_short)
+        lines.append(HASHTAGS)
+        # remove empty lines caused by optional parts
+        cleaned = []
+        for ln in lines:
+            ln = (ln or "").rstrip()
+            if ln == "" and (not cleaned or cleaned[-1] == ""):
+                continue
+            cleaned.append(ln)
+        return "\n".join(cleaned).strip()
+
+    # Try best -> progressively shorter
+    candidates = [
+        compose(include_when=True, include_care=True, what_count=2),
+        compose(include_when=False, include_care=True, what_count=2),
+        compose(include_when=False, include_care=True, what_count=1),
+        compose(include_when=False, include_care=False, what_count=2),
+        compose(include_when=False, include_care=False, what_count=1),
+    ]
+
+    for t in candidates:
+        if len(t) <= 280:
+            return t
+
+    # Hard truncate last resort (keep hashtags)
+    t = candidates[-1]
+    if len(t) <= 280:
+        return t
+
+    # preserve last line hashtags
+    lines = t.splitlines()
+    if not lines:
+        return t[:280]
+    tail = lines[-1]
+    head = "\n".join(lines[:-1]).rstrip()
+    room = 280 - (len(tail) + 1)
+    if room < 0:
+        return tail[:280]
+    head = head[:room].rstrip()
+    return (head + "\n" + tail).strip()
+
+def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
+    header = f"{emoji} {event_name} in Tay Township".strip()
+
+    headline = (details.get("headline") or "").strip()
+    what_lines = details.get("what_lines") or []
+    when_line = (details.get("when_line") or "").strip()
+    issued_short = (details.get("issued_short") or "").strip()
+
+    # Warmer, a bit longer, still no Oxford commas
+    care = (
+        "If you can, please stay off the roads and give crews room to work. "
+        "If you must go out, slow down, leave extra space and keep your lights on. "
+        "Please check on neighbours who may need help staying warm or getting supplies."
+    )
+
+    lines: List[str] = [header]
+    if headline:
+        lines.append(headline)
+
+    chosen_what = [w for w in what_lines if w][:FB_WHAT_MAX]
+    if chosen_what:
+        lines.append("")
+        lines.extend(chosen_what)
+
+    if when_line:
+        lines.append("")
+        lines.append(f"When: {when_line}".replace("When: When:", "When:").strip())
+
+    lines.append("")
+    lines.append(care)
+    lines.append("")
+    lines.append(f"More: {MORE_INFO_URL}")
+    if issued_short:
+        lines.append(issued_short)
+    lines.append(HASHTAGS)
+
+    # clean double blanks
+    cleaned = []
+    for ln in lines:
+        ln = (ln or "").rstrip()
+        if ln == "" and (not cleaned or cleaned[-1] == ""):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
+
+# ----------------------------
+# RSS helpers (unchanged)
+# ----------------------------
 def ensure_rss_exists() -> None:
     if os.path.exists(RSS_PATH):
         return
@@ -395,7 +506,6 @@ def ensure_rss_exists() -> None:
 
     ET.ElementTree(rss).write(RSS_PATH, encoding="utf-8", xml_declaration=True)
 
-
 def load_rss_tree() -> Tuple[ET.ElementTree, ET.Element]:
     ensure_rss_exists()
     tree = ET.parse(RSS_PATH)
@@ -405,14 +515,12 @@ def load_rss_tree() -> Tuple[ET.ElementTree, ET.Element]:
         raise RuntimeError("RSS file missing <channel>")
     return tree, channel
 
-
 def rss_item_exists(channel: ET.Element, guid_text: str) -> bool:
     for item in channel.findall("item"):
         guid = item.find("guid")
         if guid is not None and (guid.text or "").strip() == guid_text:
             return True
     return False
-
 
 def add_rss_item(channel: ET.Element, title: str, link: str, guid: str, pub_date: str, description: str) -> None:
     item = ET.Element("item")
@@ -430,7 +538,6 @@ def add_rss_item(channel: ET.Element, title: str, link: str, guid: str, pub_date
             insert_index = i + 1
     channel.insert(insert_index, item)
 
-
 def trim_rss_items(channel: ET.Element, max_items: int) -> None:
     items = channel.findall("item")
     if len(items) <= max_items:
@@ -438,18 +545,14 @@ def trim_rss_items(channel: ET.Element, max_items: int) -> None:
     for item in items[max_items:]:
         channel.remove(item)
 
-
 MAX_RSS_ITEMS = 25
 
-
 # ----------------------------
-# Cooldown logic
+# Cooldown logic (unchanged)
 # ----------------------------
-
 def group_key_for_cooldown(area_name: str, kind: str) -> str:
     raw = f"{normalize(area_name)}|{normalize(kind)}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
 
 def cooldown_allows_post(state: Dict[str, Any], area_name: str, kind: str = "alert") -> Tuple[bool, str]:
     now_ts = int(time.time())
@@ -468,7 +571,6 @@ def cooldown_allows_post(state: Dict[str, Any], area_name: str, kind: str = "ale
 
     return True, "OK"
 
-
 def mark_posted(state: Dict[str, Any], area_name: str, kind: str = "alert") -> None:
     now_ts = int(time.time())
     key = group_key_for_cooldown(area_name, kind)
@@ -476,16 +578,12 @@ def mark_posted(state: Dict[str, Any], area_name: str, kind: str = "alert") -> N
     state["cooldowns"][key] = now_ts
     state["global_last_post_ts"] = now_ts
 
-
 # ----------------------------
-# Ontario 511 camera resolver
+# Ontario 511 camera resolver (unchanged)
 # ----------------------------
-
 _ON511_CAMERAS_CACHE: Optional[List[Dict[str, Any]]] = None
 
-
 def is_image_url(url: str) -> bool:
-    """Does URL respond with Content-Type image/*?"""
     url = (url or "").strip()
     if not url:
         return False
@@ -505,7 +603,6 @@ def is_image_url(url: str) -> bool:
     except Exception:
         return False
 
-
 def fetch_on511_cameras() -> List[Dict[str, Any]]:
     global _ON511_CAMERAS_CACHE
     if _ON511_CAMERAS_CACHE is not None:
@@ -519,7 +616,6 @@ def fetch_on511_cameras() -> List[Dict[str, Any]]:
 
     _ON511_CAMERAS_CACHE = data
     return data
-
 
 def resolve_on511_views_by_keyword(keyword: str) -> List[Dict[str, Any]]:
     kw = normalize(keyword)
@@ -535,9 +631,7 @@ def resolve_on511_views_by_keyword(keyword: str) -> List[Dict[str, Any]]:
                 for v in views:
                     if isinstance(v, dict):
                         out.append(v)
-
     return out
-
 
 def pick_north_south_view_urls(views: List[Dict[str, Any]]) -> Tuple[str, str]:
     north = ""
@@ -574,14 +668,11 @@ def pick_north_south_view_urls(views: List[Dict[str, Any]]) -> Tuple[str, str]:
 
     return north, south
 
-
 def resolve_cr29_image_urls() -> List[str]:
-    """Resolve up to two image URLs (north, south) with fallbacks."""
     north_env = (os.getenv("CR29_NORTH_IMAGE_URL") or "").strip()
     south_env = (os.getenv("CR29_SOUTH_IMAGE_URL") or "").strip()
 
     urls: List[str] = []
-
     for u in [north_env, south_env]:
         if u and is_image_url(u) and u not in urls:
             urls.append(u)
@@ -600,18 +691,15 @@ def resolve_cr29_image_urls() -> List[str]:
 
     return urls[:2]
 
-
 # ----------------------------
-# X OAuth2 (posting) helpers
+# X OAuth2 (posting) helpers (unchanged)
 # ----------------------------
-
 def write_rotated_refresh_token(new_refresh: str) -> None:
     new_refresh = (new_refresh or "").strip()
     if not new_refresh:
         return
     with open(ROTATED_X_REFRESH_TOKEN_PATH, "w", encoding="utf-8") as f:
         f.write(new_refresh)
-
 
 def get_oauth2_access_token() -> str:
     client_id = os.getenv("X_CLIENT_ID", "").strip()
@@ -654,11 +742,9 @@ def get_oauth2_access_token() -> str:
 
     return access
 
-
 # ----------------------------
-# X media upload helpers (OAuth 1.0a)
+# X media upload helpers (OAuth 1.0a) (unchanged)
 # ----------------------------
-
 def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
     image_url = (image_url or "").strip()
     if not image_url:
@@ -672,7 +758,6 @@ def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
         raise RuntimeError(f"URL did not return an image. Content-Type={content_type}")
 
     return r.content, content_type
-
 
 def x_upload_media(image_url: str) -> str:
     api_key = os.getenv("X_API_KEY", "").strip()
@@ -707,7 +792,6 @@ def x_upload_media(image_url: str) -> str:
         raise RuntimeError("X media upload succeeded but no media_id returned")
 
     return media_id
-
 
 def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     url = "https://api.x.com/2/tweets"
@@ -754,11 +838,9 @@ def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> Dict[str, An
 
     return r.json()
 
-
 # ----------------------------
-# Facebook Page posting helpers
+# Facebook posting helpers (unchanged)
 # ----------------------------
-
 def post_to_facebook_page(message: str) -> Dict[str, Any]:
     page_id = os.getenv("FB_PAGE_ID", "").strip()
     page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
@@ -772,7 +854,6 @@ def post_to_facebook_page(message: str) -> Dict[str, Any]:
         raise RuntimeError(f"Facebook feed post failed {r.status_code}")
     return r.json()
 
-
 def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     page_id = os.getenv("FB_PAGE_ID", "").strip()
     page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
@@ -784,11 +865,7 @@ def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
     r = requests.post(
         url,
-        data={
-            "url": image_url,
-            "caption": caption,
-            "access_token": page_token,
-        },
+        data={"url": image_url, "caption": caption, "access_token": page_token},
         timeout=30,
     )
     print("FB POST /photos status:", r.status_code)
@@ -796,14 +873,10 @@ def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
         raise RuntimeError(f"Facebook photo post failed {r.status_code}")
     return r.json()
 
-
 def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[str, Any]:
-    """Posts up to 10 images as a single carousel post."""
     image_urls = [u for u in (image_urls or []) if (u or "").strip()]
-
     if not image_urls:
         return post_to_facebook_page(caption)
-
     if len(image_urls) == 1:
         return post_photo_to_facebook_page(caption, image_urls[0])
 
@@ -813,17 +886,12 @@ def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[
         raise RuntimeError("Missing FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN")
 
     media_fbids: List[str] = []
-
     for u in image_urls[:10]:
         try:
             url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
             r = requests.post(
                 url,
-                data={
-                    "url": u,
-                    "published": "false",
-                    "access_token": page_token,
-                },
+                data={"url": u, "published": "false", "access_token": page_token},
                 timeout=30,
             )
             if r.status_code >= 400:
@@ -854,13 +922,25 @@ def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[
 
     return r.json()
 
+# ----------------------------
+# RSS description (unchanged-ish)
+# ----------------------------
+def build_rss_description_from_atom(entry: Dict[str, Any]) -> str:
+    title = (entry.get("title") or "").strip()
+    issued = (entry.get("summary") or "").strip()
+    official = (entry.get("link") or "").strip()
+    bits = [title]
+    if issued:
+        bits.append(issued)
+    bits.append(f"More info (Tay Township): {MORE_INFO_URL}")
+    if official:
+        bits.append(f"Official alert details: {official}")
+    return "\n".join(bits)
 
 # ----------------------------
 # Main
 # ----------------------------
-
 def main() -> None:
-    # Clean up any previous rotated token file
     if os.path.exists(ROTATED_X_REFRESH_TOKEN_PATH):
         try:
             os.remove(ROTATED_X_REFRESH_TOKEN_PATH)
@@ -899,7 +979,8 @@ def main() -> None:
         if not guid:
             continue
 
-        title = atom_title_for_tay((entry.get("title") or "Weather alert").strip())
+        # RSS update
+        title = (entry.get("title") or "Weather alert").strip()
         pub_dt = entry.get("updated_dt") or dt.datetime.now(dt.timezone.utc)
         pub_date = email.utils.format_datetime(pub_dt)
         link = MORE_INFO_URL
@@ -918,32 +999,45 @@ def main() -> None:
             print("Social skipped:", reason)
             continue
 
-        social_text = build_social_text_from_atom(entry)
-        h = text_hash(social_text)
+        # Build new-style social text by parsing EC HTML page
+        emoji = emoji_from_atom_title(entry.get("title") or "")
+        event_name = clean_atom_event_name(entry.get("title") or "")
 
+        details = {}
+        try:
+            details = fetch_ec_page_details((entry.get("link") or "").strip())
+        except Exception as e:
+            print(f"⚠️ EC page parse failed, falling back to ATOM summary only: {e}")
+            details = {}
+
+        x_text = build_x_text(event_name, emoji, details)
+        fb_text = build_fb_text(event_name, emoji, details)
+
+        # Dedupe using what we actually post to X (most restrictive)
+        h = text_hash(x_text)
         if h in posted_text_hashes:
             print("Social skipped: duplicate text hash already posted")
             posted.add(guid)
             continue
 
-
-        print("Social preview:", social_text.replace("\n", " "))
+        print("X preview:", x_text.replace("\n", " | "))
+        print("FB preview:", fb_text.replace("\n", " | "))
 
         posted_anywhere = False
 
         if ENABLE_X_POSTING:
             try:
-                post_to_x(social_text, image_urls=camera_image_urls)
+                post_to_x(x_text, image_urls=camera_image_urls)
                 posted_anywhere = True
             except RuntimeError as e:
                 if str(e) == "X_DUPLICATE_TWEET":
-                    print("X rejected duplicate tweet text; skipping.")
+                    print("X rejected duplicate tweet text, skipping.")
                 else:
                     raise
 
         if ENABLE_FB_POSTING:
             try:
-                post_carousel_to_facebook_page(social_text, camera_image_urls)
+                post_carousel_to_facebook_page(fb_text, camera_image_urls)
                 posted_anywhere = True
             except RuntimeError as e:
                 print(f"Facebook skipped: {e}")
@@ -974,7 +1068,6 @@ def main() -> None:
         f"social_posted={social_posted}",
         f"social_skipped_cooldown={social_skipped_cooldown}",
     )
-
 
 if __name__ == "__main__":
     main()
