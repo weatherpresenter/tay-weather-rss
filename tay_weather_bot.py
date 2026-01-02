@@ -293,7 +293,7 @@ def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
         lambda m: f"{m.group(1).upper()}M_TOKEN",
         summary,
         flags=re.I,
-)
+    )
 
     for line in protected.splitlines():
         line = line.strip()
@@ -306,7 +306,7 @@ def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
         p = p.replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
         chunks.append(p)
 
-sentences = chunks
+    sentences = chunks
 
 
 
