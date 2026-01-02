@@ -328,9 +328,11 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
 
     if before_what.strip():
         lines = [ln.strip() for ln in before_what.splitlines() if ln.strip()]
-        # Some EC pages include a standalone "Alert." line — skip it
-        if lines and lines[0].lower() == "alert.":
+
+        # Some EC pages include a standalone label line like "Alert." or "Alerts." — skip it
+        while lines and lines[0].strip().lower() in {"alert.", "alerts.", "alert", "alerts"}:
             lines = lines[1:]
+
         headline = (lines[0] if lines else "").strip()
 
     # Ensure punctuation
