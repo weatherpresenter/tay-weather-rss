@@ -91,6 +91,8 @@ jobs:
         env:
           ALERT_FEED_URL: "https://weather.gc.ca/rss/battleboard/onrm94_e.xml"
           TAY_COORDS_URL: "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
+          TAY_ALERTS_URL: "https://weatherpresenter.github.io/tay-weather-rss/tay/"
+
 
           # X OAuth 1.0a (required for media upload)
           X_API_KEY: ${{ secrets.X_API_KEY }}
