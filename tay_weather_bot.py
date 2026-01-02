@@ -5,9 +5,10 @@
 # - For each entry, fetches the EC HTML alert page and extracts:
 #     * issued time (short)
 #     * headline (first meaningful sentence before "What:")
-#     * What lines (Twitter up to 2, Facebook up to 3)
+#     * What lines (X up to 2, Facebook up to 3)
 #     * When line (only if space on X; generally included on FB)
-# - Two images for both X and Facebook
+# - Two images for both X and Facebook (Ontario 511 CR-29 cameras)
+# - Optional ON511 logo watermark applied locally before upload
 # - X: hard 280 chars including spaces, keep hashtags, no Oxford commas, Canadian spelling
 #
 import base64
@@ -19,9 +20,11 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from PIL import Image
 from requests_oauthlib import OAuth1
 
 # ----------------------------
@@ -37,6 +40,11 @@ TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
 STATE_PATH = "state.json"
 RSS_PATH = "tay-weather.xml"
 ROTATED_X_REFRESH_TOKEN_PATH = "x_refresh_token_rotated.txt"
+
+# Watermark options (optional)
+WATERMARK_ON511 = os.getenv("WATERMARK_ON511", "true").lower() == "true"
+ON511_LOGO_PATH = os.getenv("ON511_LOGO_PATH", "assets/On511_logo.png").strip()
+WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.35"))  # 0..1
 
 USER_AGENT = "tay-weather-rss-bot/2.0"
 
@@ -146,6 +154,42 @@ def save_state(state: dict) -> None:
 
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+
+# ----------------------------
+# Image helpers (ON511 watermark)
+# ----------------------------
+def overlay_on511_logo(img_bytes: bytes, logo_path: str) -> bytes:
+    """
+    Overlays the ON511 logo onto an image (bottom-right).
+    Returns new JPEG bytes.
+    """
+    with Image.open(BytesIO(img_bytes)).convert("RGBA") as base:
+        with Image.open(logo_path).convert("RGBA") as logo:
+            bw, bh = base.size
+
+            # scale logo to ~6% of image width
+            target_w = max(40, int(bw * 0.06))
+            scale = target_w / max(1, logo.size[0])
+            target_h = max(1, int(logo.size[1] * scale))
+            logo = logo.resize((target_w, target_h), Image.LANCZOS)
+
+            # apply opacity
+            if WATERMARK_OPACITY < 1.0:
+                alpha = logo.split()[-1]
+                opacity = max(0.0, min(1.0, WATERMARK_OPACITY))
+                alpha = alpha.point(lambda p: int(p * opacity))
+                logo.putalpha(alpha)
+
+            pad = max(6, int(bw * 0.01))
+            x = bw - logo.size[0] - pad
+            y = bh - logo.size[1] - pad
+
+            base.alpha_composite(logo, dest=(x, y))
+
+            out = BytesIO()
+            base.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
+            return out.getvalue()
 
 
 # ----------------------------
@@ -277,9 +321,7 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
     r.raise_for_status()
     text = _html_to_text(r.text)
 
-    # ----------------------------
-    # Issued line (raw/short)
-    # ----------------------------
+    # Issued line (raw)
     issued_raw = ""
     m = re.search(
         r"\b(\d{1,2}:\d{2}\s*(?:AM|PM)\s*EST\s+\w+\s+\d{1,2}\s+\w+\s+\d{4})\b",
@@ -320,16 +362,13 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             mon = mon_map.get(mon_name.strip().lower(), mon_name[:3].title())
             issued_short = f"Issued {mon} {day} {hh}:{mm}{'a' if ap=='am' else 'p'}"
 
-    # ----------------------------
-    # Narrative extraction (STRICT)
-    # Only parse AFTER the "* * *" divider.
-    # ----------------------------
+    # Narrative extraction (STRICT) — only after "* * *"
     narrative = ""
     m_sep = re.search(r"\*\s*\*\s*\*", text)
     if m_sep:
         narrative = text[m_sep.end():].strip()
 
-    # If divider isn't found, fail cleanly (prevents navbar/profile/shortcuts text)
+    # If divider isn't found, fail cleanly
     if not narrative:
         return {
             "issued_raw": issued_raw,
@@ -339,9 +378,7 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             "when_line": "",
         }
 
-    # ----------------------------
-    # Extract What and When blocks from narrative
-    # ----------------------------
+    # Extract What/When blocks
     what_block = ""
     when_block = ""
     if "What:" in narrative:
@@ -352,13 +389,9 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
         else:
             what_block = after_what
 
-    # ----------------------------
-    # Headline = first meaningful line before "What:" (no fragments)
-    # ----------------------------
+    # Headline: first meaningful line before "What:"
     headline = ""
-    before_what = narrative
-    if "What:" in before_what:
-        before_what = before_what.split("What:", 1)[0]
+    before_what = narrative.split("What:", 1)[0] if "What:" in narrative else narrative
 
     if before_what.strip():
         lines = [ln.strip() for ln in before_what.splitlines() if ln.strip()]
@@ -367,13 +400,10 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             line = (line or "").strip()
             if not line:
                 return True
-            # Reject fragments like "formation."
             if len(line.split()) < 4:
                 return True
-            # EC headline sentences are sentence-case; fragments often are not
             if not line[0].isupper():
                 return True
-            # Reject very short lines
             if len(line) < 20:
                 return True
             return False
@@ -387,9 +417,7 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
     if headline and not headline.endswith("."):
         headline += "."
 
-    # ----------------------------
     # What lines: split by sentence
-    # ----------------------------
     what_lines: List[str] = []
     if what_block:
         what_block = what_block.split("Additional information:", 1)[0]
@@ -408,9 +436,7 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
                 s += "."
             what_lines.append(s)
 
-    # ----------------------------
     # When line: first sentence only
-    # ----------------------------
     when_line = ""
     if when_block:
         when_block = when_block.split("Additional information:", 1)[0]
@@ -460,6 +486,7 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
 
     def compose(include_when: bool, include_care: bool, what_count: int) -> str:
         lines = list(base_lines)
+
         if what_count > 0:
             lines.append("")
             lines.extend(chosen_what[:what_count])
@@ -477,7 +504,7 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
             lines.append(issued_short)
         lines.append(HASHTAGS)
 
-        cleaned = []
+        cleaned: List[str] = []
         for ln in lines:
             ln = (ln or "").rstrip()
             if ln == "" and (not cleaned or cleaned[-1] == ""):
@@ -549,7 +576,7 @@ def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
         lines.append(issued_short)
     lines.append(HASHTAGS)
 
-    cleaned = []
+    cleaned: List[str] = []
     for ln in lines:
         ln = (ln or "").rstrip()
         if ln == "" and (not cleaned or cleaned[-1] == ""):
@@ -674,12 +701,7 @@ def is_image_url(url: str) -> bool:
         return False
 
     try:
-        r = requests.head(
-            url,
-            allow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
-            timeout=(5, 15),
-        )
+        r = requests.head(url, allow_redirects=True, headers={"User-Agent": USER_AGENT}, timeout=(5, 15))
         ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if r.status_code < 400 and ct.startswith("image/"):
             return True
@@ -687,12 +709,7 @@ def is_image_url(url: str) -> bool:
         pass
 
     try:
-        r = requests.get(
-            url,
-            allow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
-            timeout=(5, 20),
-        )
+        r = requests.get(url, allow_redirects=True, headers={"User-Agent": USER_AGENT}, timeout=(5, 20))
         ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         return r.status_code < 400 and ct.startswith("image/")
     except Exception:
@@ -807,15 +824,11 @@ def get_oauth2_access_token() -> str:
     client_secret = os.getenv("X_CLIENT_SECRET", "").strip()
     refresh_token = os.getenv("X_REFRESH_TOKEN", "").strip()
 
-    missing = [
-        k
-        for k, v in [
-            ("X_CLIENT_ID", client_id),
-            ("X_CLIENT_SECRET", client_secret),
-            ("X_REFRESH_TOKEN", refresh_token),
-        ]
-        if not v
-    ]
+    missing = [k for k, v in [
+        ("X_CLIENT_ID", client_id),
+        ("X_CLIENT_SECRET", client_secret),
+        ("X_REFRESH_TOKEN", refresh_token),
+    ] if not v]
     if missing:
         raise RuntimeError(f"Missing required X env vars: {', '.join(missing)}")
 
@@ -856,19 +869,24 @@ def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
     if not image_url:
         raise RuntimeError("No image_url provided")
 
-    r = requests.get(
-        image_url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=(10, 30),
-        allow_redirects=True,
-    )
+    r = requests.get(image_url, headers={"User-Agent": USER_AGENT}, timeout=(10, 30), allow_redirects=True)
     r.raise_for_status()
 
     content_type = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     if not content_type.startswith("image/"):
         raise RuntimeError(f"URL did not return an image. Content-Type={content_type}")
 
-    return r.content, content_type
+    img = r.content
+
+    # Apply watermark (optional)
+    if WATERMARK_ON511 and os.path.exists(ON511_LOGO_PATH):
+        try:
+            img = overlay_on511_logo(img, ON511_LOGO_PATH)
+            content_type = "image/jpeg"
+        except Exception as e:
+            print(f"⚠️ Watermark skipped: {e}")
+
+    return img, content_type
 
 
 def x_upload_media(image_url: str) -> str:
@@ -877,16 +895,12 @@ def x_upload_media(image_url: str) -> str:
     access_token = os.getenv("X_ACCESS_TOKEN", "").strip()
     access_secret = os.getenv("X_ACCESS_TOKEN_SECRET", "").strip()
 
-    missing = [
-        k
-        for k, v in [
-            ("X_API_KEY", api_key),
-            ("X_API_SECRET", api_secret),
-            ("X_ACCESS_TOKEN", access_token),
-            ("X_ACCESS_TOKEN_SECRET", access_secret),
-        ]
-        if not v
-    ]
+    missing = [k for k, v in [
+        ("X_API_KEY", api_key),
+        ("X_API_SECRET", api_secret),
+        ("X_ACCESS_TOKEN", access_token),
+        ("X_ACCESS_TOKEN_SECRET", access_secret),
+    ] if not v]
     if missing:
         raise RuntimeError(f"Missing required X OAuth1 env vars: {', '.join(missing)}")
 
@@ -981,15 +995,17 @@ def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     if not image_url:
         raise RuntimeError("Missing image_url for FB photo post")
 
+    # download + watermark (same function used for X)
+    img_bytes, mime_type = download_image_bytes(image_url)
+
     url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
-    r = requests.post(
-        url,
-        data={"url": image_url, "caption": caption, "access_token": page_token},
-        timeout=30,
-    )
-    print("FB POST /photos status:", r.status_code)
+    files = {"source": ("image.jpg", img_bytes, mime_type)}
+    data = {"caption": caption, "access_token": page_token}
+
+    r = requests.post(url, data=data, files=files, timeout=60)
+    print("FB POST /photos (source) status:", r.status_code)
     if r.status_code >= 400:
-        raise RuntimeError(f"Facebook photo post failed {r.status_code}")
+        raise RuntimeError(f"Facebook photo post failed {r.status_code} {r.text}")
     return r.json()
 
 
@@ -1005,17 +1021,21 @@ def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[
     if not page_id or not page_token:
         raise RuntimeError("Missing FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN")
 
+    upload_url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
+
     media_fbids: List[str] = []
     for u in image_urls[:10]:
         try:
-            url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
+            img_bytes, mime_type = download_image_bytes(u)
+            files = {"source": ("image.jpg", img_bytes, mime_type)}
             r = requests.post(
-                url,
-                data={"url": u, "published": "false", "access_token": page_token},
-                timeout=30,
+                upload_url,
+                data={"published": "false", "access_token": page_token},
+                files=files,
+                timeout=60,
             )
             if r.status_code >= 400:
-                print(f"⚠️ FB carousel upload failed for one image: {r.status_code}")
+                print(f"⚠️ FB carousel upload failed for one image: {r.status_code} {r.text}")
                 continue
             j = r.json()
             fbid = j.get("id")
@@ -1038,7 +1058,7 @@ def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[
     r = requests.post(feed_url, data=data, timeout=30)
     print("FB POST /feed (carousel) status:", r.status_code)
     if r.status_code >= 400:
-        raise RuntimeError(f"Facebook carousel post failed {r.status_code}")
+        raise RuntimeError(f"Facebook carousel post failed {r.status_code} {r.text}")
 
     return r.json()
 
@@ -1057,6 +1077,67 @@ def build_rss_description_from_atom(entry: Dict[str, Any]) -> str:
     if official:
         bits.append(f"Official alert details: {official}")
     return "\n".join(bits)
+
+
+# ----------------------------
+# RSS file functions
+# ----------------------------
+def ensure_rss_exists() -> None:
+    if os.path.exists(RSS_PATH):
+        return
+
+    rss = ET.Element("rss", version="2.0")
+    channel = ET.SubElement(rss, "channel")
+
+    ET.SubElement(channel, "title").text = "Tay Township Weather Statements"
+    ET.SubElement(channel, "link").text = "https://weatherpresenter.github.io/tay-weather-rss/"
+    ET.SubElement(channel, "description").text = "Automated weather statements and alerts for Tay Township area."
+    ET.SubElement(channel, "language").text = "en-ca"
+
+    ET.ElementTree(rss).write(RSS_PATH, encoding="utf-8", xml_declaration=True)
+
+
+def load_rss_tree() -> Tuple[ET.ElementTree, ET.Element]:
+    ensure_rss_exists()
+    tree = ET.parse(RSS_PATH)
+    root = tree.getroot()
+    channel = root.find("channel")
+    if channel is None:
+        raise RuntimeError("RSS file missing <channel>")
+    return tree, channel
+
+
+def rss_item_exists(channel: ET.Element, guid_text: str) -> bool:
+    for item in channel.findall("item"):
+        guid = item.find("guid")
+        if guid is not None and (guid.text or "").strip() == guid_text:
+            return True
+    return False
+
+
+def add_rss_item(channel: ET.Element, title: str, link: str, guid: str, pub_date: str, description: str) -> None:
+    item = ET.Element("item")
+    ET.SubElement(item, "title").text = title
+    ET.SubElement(item, "link").text = link
+    g = ET.SubElement(item, "guid")
+    g.text = guid
+    g.set("isPermaLink", "false")
+    ET.SubElement(item, "pubDate").text = pub_date
+    ET.SubElement(item, "description").text = description
+
+    insert_index = 0
+    for i, child in enumerate(list(channel)):
+        if child.tag in {"title", "link", "description", "language", "lastBuildDate"}:
+            insert_index = i + 1
+    channel.insert(insert_index, item)
+
+
+def trim_rss_items(channel: ET.Element, max_items: int) -> None:
+    items = channel.findall("item")
+    if len(items) <= max_items:
+        return
+    for item in items[max_items:]:
+        channel.remove(item)
 
 
 # ----------------------------
