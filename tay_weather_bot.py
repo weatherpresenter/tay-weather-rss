@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests_oauthlib import OAuth1
+import facebook_poster as fb  # FB rate-limited safe posting
 import facebook_poster as fb
 fb.load_image_bytes = load_image_bytes  # reuse your existing function
 
@@ -1471,7 +1472,18 @@ def main() -> None:
         if ENABLE_X_POSTING:
             post_to_x(text, image_urls=camera_image_urls)
         if ENABLE_FB_POSTING:
-            post_carousel_to_facebook_page(text, camera_image_urls)
+            state = load_state()
+            try:
+                fb_result = fb.safe_post_facebook(
+                    state,
+                    caption=text,
+                    image_urls=camera_image_urls,
+                    has_new_social_event=True,
+                    state_path=STATE_PATH,
+                )
+                print("FB result:", fb_result)
+            except Exception as e:
+                print(f"⚠️ Facebook posting encountered an unexpected error; skipping: {e}")
         return
 
     state = load_state()
@@ -1603,10 +1615,18 @@ def main() -> None:
 
         if ENABLE_FB_POSTING:
             try:
-                post_carousel_to_facebook_page(social_text, chosen_images)
-                posted_anywhere = True
-            except RuntimeError as e:
-                print(f"Facebook skipped: {e}")
+                fb_result = fb.safe_post_facebook(
+                    state,
+                    caption=social_text,
+                    image_urls=chosen_images,
+                    has_new_social_event=True,
+                    state_path=STATE_PATH,
+                )
+                print("FB result:", fb_result)
+                if fb_result.get("posted"):
+                    posted_anywhere = True
+            except Exception as e:
+                print(f"⚠️ Facebook posting encountered an unexpected error; skipping: {e}")
 
         if posted_anywhere:
             social_posted += 1
