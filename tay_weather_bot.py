@@ -983,7 +983,7 @@ def post_to_facebook_page(message: str) -> Dict[str, Any]:
     r = requests.post(url, data={"message": message, "access_token": page_token}, timeout=30)
     print("FB POST /feed status:", r.status_code)
     if r.status_code >= 400:
-        raise RuntimeError(f"Facebook feed post failed {r.status_code}")
+    raise RuntimeError(f"Facebook feed post failed {r.status_code} {r.text}")
     return r.json()
 
 
