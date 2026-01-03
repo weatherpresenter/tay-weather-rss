@@ -1,15 +1,16 @@
 # tay_weather_bot.py
 #
-# Tay Township Weather Bot (v2.1)
+# Tay Township Weather Bot (v2.2 - JSON-from-view-source EC parser)
 # - Uses Environment Canada ATOM feed as the alert list (source of truth)
-# - For each entry, fetches the EC HTML alert page and extracts:
-#     * issued time (short)
-#     * headline (first meaningful sentence before "What:")
+# - For each entry, fetches the EC HTML alert page and extracts (from embedded JSON in page source):
+#     * headline (first paragraph in embedded "text")
 #     * What lines (X up to 2, Facebook up to 3)
 #     * When line (first sentence)
+#     * care_text (from "Additional information:" / "Care:" / "Preparedness:" when present)
+#   Also extracts issued time (short) from page text as before.
 # - Posts to X + Facebook (optional toggles)
 # - X: hard 280 chars including spaces
-# - Facebook: includes fuller care statement
+# - Facebook: includes fuller care statement (prefers EC care_text when available)
 #
 import base64
 import datetime as dt
@@ -46,7 +47,7 @@ WATERMARK_ON511 = os.getenv("WATERMARK_ON511", "true").lower() == "true"
 ON511_LOGO_PATH = os.getenv("ON511_LOGO_PATH", "assets/On511_logo.png").strip()
 WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.35"))  # 0..1
 
-USER_AGENT = "tay-weather-rss-bot/2.1"
+USER_AGENT = "tay-weather-rss-bot/2.2"
 
 # Public “more info” URL (prefer GitHub page)
 TAY_COORDS_URL = os.getenv(
@@ -287,8 +288,9 @@ def clean_atom_event_name(title_raw: str) -> str:
 
     return t or "Weather alert"
 
+
 # ----------------------------
-# EC HTML parsing helpers
+# EC parsing helpers
 # ----------------------------
 def _html_to_text(html: str) -> str:
     if not html:
@@ -307,27 +309,180 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+def _extract_ec_embedded_text_from_page_source(html: str) -> str:
+    """
+    Extract the embedded JSON string value for the alert "text" field from EC page source.
+
+    In View Source you’ll see something like:
+      ..."text":"Snow squalls continue tonight.\n\nWhat:\n...","confidence":"High"...
+    We capture the raw JSON string content and json-decode it to turn \n into real newlines.
+    """
+    if not html:
+        return ""
+
+    m = re.search(r'"text"\s*:\s*"(?P<raw>.*?)"\s*,\s*"confidence"', html, flags=re.DOTALL)
+    if not m:
+        return ""
+
+    raw = m.group("raw")
+    try:
+        return json.loads(f'"{raw}"')
+    except Exception:
+        return raw.replace(r"\n", "\n").replace(r"\\", "\\")
+
+
+def _first_sentence(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"\s+", " ", text).strip()
+
+    protected = re.sub(
+        r"\b([ap])\.m\.\b",
+        lambda m: f"{m.group(1).upper()}M_TOKEN",
+        t,
+        flags=re.I,
+    )
+    sents = [s.strip() for s in protected.split(".") if s.strip()]
+    if not sents:
+        return ""
+    s = sents[0].replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
+    if not s.endswith("."):
+        s += "."
+    return s
+
+
+def _sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    t = re.sub(r"\s+", " ", text).strip()
+
+    protected = re.sub(
+        r"\b([ap])\.m\.\b",
+        lambda m: f"{m.group(1).upper()}M_TOKEN",
+        t,
+        flags=re.I,
+    )
+    raw_sents = [s.strip() for s in protected.split(".") if s.strip()]
+    out: List[str] = []
+    for s in raw_sents:
+        s = s.replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
+        if not s.endswith("."):
+            s += "."
+        out.append(s)
+    return out
+
+
+def _parse_ec_alert_text_sections(alert_text: str) -> Dict[str, Any]:
+    """
+    Parse the EC embedded alert text into sections.
+
+    Expected structure like:
+      Headline paragraph
+
+      What:
+      ...
+
+      When:
+      ...
+
+      Additional information:
+      ...
+    """
+    out: Dict[str, Any] = {
+        "headline": "",
+        "what_text": "",
+        "when_text": "",
+        "care_text": "",
+        "what_lines": [],
+        "when_line": "",
+    }
+
+    if not alert_text:
+        return out
+
+    blocks = [b.strip() for b in alert_text.strip().split("\n\n") if b.strip()]
+    if not blocks:
+        return out
+
+    out["headline"] = blocks[0].strip()
+
+    current: Optional[str] = None
+    buf: List[str] = []
+
+    def flush() -> None:
+        nonlocal current, buf
+        if not current:
+            buf = []
+            return
+        joined = "\n\n".join(buf).strip()
+        if current == "what":
+            out["what_text"] = joined
+        elif current == "when":
+            out["when_text"] = joined
+        elif current == "care":
+            out["care_text"] = joined
+        buf = []
+
+    for b in blocks[1:]:
+        if b.startswith("What:"):
+            flush()
+            current = "what"
+            buf.append(b[len("What:") :].strip())
+            continue
+        if b.startswith("When:"):
+            flush()
+            current = "when"
+            buf.append(b[len("When:") :].strip())
+            continue
+        if b.startswith("Care:"):
+            flush()
+            current = "care"
+            buf.append(b[len("Care:") :].strip())
+            continue
+        if b.startswith("Preparedness:"):
+            flush()
+            current = "care"
+            buf.append(b[len("Preparedness:") :].strip())
+            continue
+        if b.startswith("Additional information:"):
+            flush()
+            current = "care"
+            buf.append(b[len("Additional information:") :].strip())
+            continue
+
+        # append continuation to current section if any
+        if current:
+            buf.append(b)
+
+    flush()
+
+    out["what_lines"] = _sentences(out.get("what_text", "")) if out.get("what_text") else []
+    out["when_line"] = _first_sentence(out.get("when_text", "")) if out.get("when_text") else ""
+    return out
+
+
 def fetch_ec_page_details(url: str) -> Dict[str, Any]:
     """
-    EC parser:
-    - Prefer parsing only after "* * *" divider (best signal).
-    - If divider isn't found, FALL BACK to a safe anchor strategy:
-        * find the first "What:" and parse around it
-        * headline = first meaningful sentence immediately before "What:"
-    This keeps us protected from navbar junk but still captures What/When.
+    Updated EC parser:
+    - Fetch EC alert HTML
+    - Extract embedded JSON "text" field (View Source)
+    - Parse headline/what/when/care from that text
+    - Keep issued_short extraction (regex over page text) for your footer line
     """
     if not url:
         return {}
 
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(8, 25))
     r.raise_for_status()
-    text = _html_to_text(r.text)
+    html = r.text
 
-    # Issued line (raw)
+    # Issued line from page text (as before)
+    text_for_issued = _html_to_text(html)
+
     issued_raw = ""
     m = re.search(
         r"\b(\d{1,2}:\d{2}\s*(?:AM|PM)\s*EST\s+\w+\s+\d{1,2}\s+\w+\s+\d{4})\b",
-        text,
+        text_for_issued,
         flags=re.I,
     )
     if m:
@@ -364,116 +519,29 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
             mon = mon_map.get(mon_name.strip().lower(), mon_name[:3].title())
             issued_short = f"Issued {mon} {day} {hh}:{mm}{'a' if ap=='am' else 'p'}"
 
-    # ----------------------------
-    # Narrative extraction
-    # ----------------------------
-    narrative = ""
+    embedded_text = _extract_ec_embedded_text_from_page_source(html)
 
-    # Preferred: only after "* * *"
-    m_sep = re.search(r"\*\s*\*\s*\*", text)
-    if m_sep:
-        narrative = text[m_sep.end():].strip()
-    else:
-        # Fallback: anchor on first "What:"
-        idx = text.find("What:")
-        if idx != -1:
-            # Take a reasonable window around it so we avoid header/menu junk
-            start = max(0, idx - 1200)
-            narrative = text[start:].strip()
-
-            # If we cut mid-word, tighten to the nearest previous blank line
-            cut = narrative.find("\n\n")
-            if cut != -1 and cut < 300:
-                narrative = narrative[cut:].strip()
-
-    # If we still have nothing useful, fail cleanly
-    if not narrative or "What:" not in narrative:
+    if not embedded_text:
         return {
             "issued_raw": issued_raw,
             "issued_short": issued_short,
             "headline": "",
             "what_lines": [],
             "when_line": "",
+            "care_text": "",
         }
 
-    # Extract What/When blocks
-    after_what = narrative.split("What:", 1)[1]
-    what_block = ""
-    when_block = ""
-
-    if "When:" in after_what:
-        what_block, after_when = after_what.split("When:", 1)
-        when_block = after_when
-    else:
-        what_block = after_what
-
-    # Headline: first meaningful sentence right before "What:"
-    before_what = narrative.split("What:", 1)[0].strip()
-
-    headline = ""
-    # collapse whitespace but keep sentence boundaries
-    before_what_clean = re.sub(r"\s+", " ", before_what).strip()
-    # split into sentences
-    raw_head_sents = [s.strip() for s in before_what_clean.split(".") if s.strip()]
-
-    def good_headline(s: str) -> bool:
-        if len(s) < 25:
-            return False
-        if len(s.split()) < 5:
-            return False
-        return True
-
-    # choose the last good sentence before What:
-    for s in reversed(raw_head_sents):
-        if good_headline(s):
-            headline = s + "."
-            break
-
-    # What lines: split by sentence
-    what_lines: List[str] = []
-    if what_block:
-        what_block = what_block.split("Additional information:", 1)[0]
-        what_block = re.sub(r"\s+", " ", what_block).strip()
-
-        protected = re.sub(
-            r"\b([ap])\.m\.\b",
-            lambda m: f"{m.group(1).upper()}M_TOKEN",
-            what_block,
-            flags=re.I,
-        )
-        raw_sents = [s.strip() for s in protected.split(".") if s.strip()]
-        for s in raw_sents:
-            s = s.replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
-            if not s.endswith("."):
-                s += "."
-            what_lines.append(s)
-
-    # When line: first sentence only
-    when_line = ""
-    if when_block:
-        when_block = when_block.split("Additional information:", 1)[0]
-        when_block = re.sub(r"\s+", " ", when_block).strip()
-
-        protected = re.sub(
-            r"\b([ap])\.m\.\b",
-            lambda m: f"{m.group(1).upper()}M_TOKEN",
-            when_block,
-            flags=re.I,
-        )
-        sents = [s.strip() for s in protected.split(".") if s.strip()]
-        if sents:
-            s = sents[0].replace("AM_TOKEN", "a.m.").replace("PM_TOKEN", "p.m.")
-            if not s.endswith("."):
-                s += "."
-            when_line = s
+    parsed = _parse_ec_alert_text_sections(embedded_text)
 
     return {
         "issued_raw": issued_raw,
         "issued_short": issued_short,
-        "headline": headline,
-        "what_lines": what_lines,
-        "when_line": when_line,
+        "headline": (parsed.get("headline") or "").strip(),
+        "what_lines": parsed.get("what_lines") or [],
+        "when_line": (parsed.get("when_line") or "").strip(),
+        "care_text": (parsed.get("care_text") or "").strip(),
     }
+
 
 # ----------------------------
 # Social text builders
@@ -495,7 +563,7 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
     care_mid = "Please take care, travel only if needed and check on neighbours who may need support."
     care_short = "Please take care, travel only if needed."
 
-    # Line 1 (your required format)
+    # Line 1 (required format)
     if headline:
         h = headline[:-1] if headline.endswith(".") else headline
         line1 = f"{emoji} - {h} in Tay Township."
@@ -549,17 +617,20 @@ def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
     Facebook:
     - Line 1 must end with "in Tay Township."
     - Include: What (up to 3), When, care, More, Issued, hashtags
+    - Prefers EC care_text if present
     """
     headline = (details.get("headline") or "").strip()
     what_lines = [w.strip() for w in (details.get("what_lines") or []) if (w or "").strip()]
     when_line = (details.get("when_line") or "").strip()
     issued_short = (details.get("issued_short") or "").strip()
 
-    care = (
-        "If you can, please stay off the roads and give crews room to work. "
-        "If you must go out, slow down, leave extra space and keep your lights on. "
-        "Please check on neighbours who may need help staying warm or getting supplies."
-    )
+    care = (details.get("care_text") or "").strip()
+    if not care:
+        care = (
+            "If you can, please stay off the roads and give crews room to work. "
+            "If you must go out, slow down, leave extra space and keep your lights on. "
+            "Please check on neighbours who may need help staying warm or getting supplies."
+        )
 
     if headline:
         h = headline[:-1] if headline.endswith(".") else headline
