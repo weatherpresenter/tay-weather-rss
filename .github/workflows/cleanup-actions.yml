@@ -2,7 +2,7 @@ name: Cleanup old workflow runs
 
 on:
   schedule:
-    - cron: "23 4 * * *"   # once daily
+    - cron: "23 4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,8 +13,10 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Delete old workflow runs (keep 25)
+      - name: Delete old workflow runs (keep 25, all workflows)
         uses: Mattraks/delete-workflow-runs@v2
         with:
           keep_minimum_runs: 25
-          retain_days: 2
+          retain_days: 0
+          delete_workflow_by_state_pattern: ALL
+          delete_run_by_conclusion_pattern: ALL
