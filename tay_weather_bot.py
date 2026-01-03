@@ -38,36 +38,15 @@ import datetime as dt
 import email.utils
 import hashlib
 import json
-import mimetypes
 import os
-import random
 import re
 import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from requests_oauthlib import OAuth1
-import facebook_poster as fb  # FB rate-limited safe posting
 import facebook_poster as fb
-fb.load_image_bytes = load_image_bytes  # reuse your existing function
-
-# Optional: Excel-backed content configuration
-try:
-    from openpyxl import load_workbook  # type: ignore
-except Exception:
-    load_workbook = None  # type: ignore
-
-# Optional: Google Sheets/Drive (private online config + media)
-try:
-    from google.oauth2 import service_account  # type: ignore
-    from googleapiclient.discovery import build  # type: ignore
-    from googleapiclient.http import MediaIoBaseDownload  # type: ignore
-except Exception:
-    service_account = None  # type: ignore
-    build = None  # type: ignore
-    MediaIoBaseDownload = None  # type: ignore
-
+from requests_oauthlib import OAuth1
 
 
 # ----------------------------
@@ -84,38 +63,6 @@ TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
 STATE_PATH = "state.json"
 RSS_PATH = "tay-weather.xml"
 ROTATED_X_REFRESH_TOKEN_PATH = "x_refresh_token_rotated.txt"
-
-# Content configuration source:
-# - "google": load from Google Sheet
-# - "xlsx": load from local Excel file in repo
-# - "auto": prefer Google if secrets exist, else fall back to xlsx
-CONTENT_CONFIG_XLSX = os.getenv("CONTENT_CONFIG_XLSX", "content_config.xlsx").strip() or "content_config.xlsx"
-CONTENT_CONFIG_SOURCE = os.getenv("CONTENT_CONFIG_SOURCE", "auto").strip().lower()
-if CONTENT_CONFIG_SOURCE not in {"auto", "google", "xlsx"}:
-    CONTENT_CONFIG_SOURCE = "auto"
-
-# Google private config + media (from GitHub Secrets)
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-
-    
-# Optional: Telegram approval (GO/NO-GO) gate
-ENABLE_TELEGRAM_APPROVAL = os.getenv("ENABLE_TELEGRAM_APPROVAL", "false").lower() == "true"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-try:
-    # Max seconds to spend polling Telegram per run (keep low for GitHub Actions)
-    TELEGRAM_POLL_SECONDS = int(os.getenv("TELEGRAM_POLL_SECONDS", "6"))
-except Exception:
-    TELEGRAM_POLL_SECONDS = 6
-
-try:
-    # How long a pending approval is kept before it's dropped (hours)
-    TELEGRAM_APPROVAL_TTL_HOURS = int(os.getenv("TELEGRAM_APPROVAL_TTL_HOURS", "72"))
-except Exception:
-    TELEGRAM_APPROVAL_TTL_HOURS = 72
 
 USER_AGENT = "tay-weather-rss-bot/1.1"
 
@@ -189,370 +136,6 @@ def safe_int(x: Any, default: int) -> int:
         return default
 
 
-# ----------------------------
-# Alert parsing + content config
-# ----------------------------
-
-def _level_and_colour(title: str) -> Tuple[str, str]:
-    """Returns (level, colour). colour is a friendly label (yellow/orange/red/grey)."""
-    t = (title or "").lower()
-    if "warning" in t:
-        return "warning", "red"
-    if "watch" in t:
-        return "watch", "orange"
-    if "advisory" in t:
-        return "advisory", "yellow"
-    if "statement" in t:
-        return "statement", "yellow"
-    return "alert", "grey"
-
-
-_TYPE_KEYWORDS = [
-    ("rainfall", "rainfall"),
-    ("heavy rain", "rainfall"),
-    ("wind", "wind"),
-    ("thunderstorm", "thunderstorm"),
-    ("tornado", "tornado"),
-    ("snow squall", "snow"),
-    ("snow", "snow"),
-    ("blizzard", "snow"),
-    ("winter storm", "winter"),
-    ("ice storm", "freezing_rain"),
-    ("freezing rain", "freezing_rain"),
-    ("heat", "heat"),
-    ("cold", "cold"),
-    ("fog", "fog"),
-    ("air quality", "air_quality"),
-]
-
-
-def alert_meta_from_title(title: str) -> Dict[str, str]:
-    """Extracts coarse metadata used for care statements + media rules."""
-    level, colour = _level_and_colour(title)
-    t = normalize(title)
-
-    # Try to extract the phrase immediately preceding the level word
-    type_phrase = ""
-    m = re.search(r"(.+?)\s+(warning|watch|advisory|statement)\b", t)
-    if m:
-        type_phrase = m.group(1).strip()
-    else:
-        type_phrase = t
-
-    type_key = "general"
-    for needle, key in _TYPE_KEYWORDS:
-        if needle in t:
-            type_key = key
-            break
-    if type_key == "general" and type_phrase:
-        type_key = re.sub(r"[^a-z0-9]+", "_", type_phrase).strip("_") or "general"
-
-    return {
-        "level": level,
-        "colour": colour,
-        "type": type_key,
-        "type_phrase": type_phrase or "general",
-    }
-
-
-def _matches(rule_val: str, actual: str) -> bool:
-    rv = normalize(str(rule_val or ""))
-    av = normalize(str(actual or ""))
-    return (not rv) or (rv == "*") or (rv == av)
-
-
-def _weighted_choice(rows: List[Dict[str, Any]], seed: str) -> Optional[Dict[str, Any]]:
-    if not rows:
-        return None
-    # Deterministic selection so reruns don't randomly change the message
-    rnd = random.Random(int(hashlib.sha1((seed or "").encode("utf-8")).hexdigest(), 16))
-
-    weights: List[float] = []
-    for r in rows:
-        w = safe_int(r.get("weight", 1), 1)
-        # Prefer more-specific rows over wildcard rows
-        specificity = 0
-        for k in ("colour", "level", "type"):
-            v = normalize(str(r.get(k, "")))
-            if v and v != "*":
-                specificity += 1
-        weights.append(max(0.1, float(w)) * (1.0 + specificity * 1.5))
-
-    total = sum(weights)
-    if total <= 0:
-        return rows[0]
-    pick = rnd.random() * total
-    upto = 0.0
-    for r, w in zip(rows, weights):
-        upto += w
-        if upto >= pick:
-            return r
-    return rows[-1]
-
-
-
-def _google_creds():
-    """Build Google service account creds from env JSON."""
-    if not service_account:
-        return None
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        return None
-    try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
-        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    except Exception as e:
-        print(f"⚠️ Google credentials invalid: {e}")
-        return None
-
-
-def _read_google_sheet_tab(sheet_id: str, tab: str, creds) -> List[List[Any]]:
-    """Returns rows for a tab using Sheets API."""
-    if not build:
-        return []
-    try:
-        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        rng = f"{tab}!A1:Z2000"
-        resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
-        return resp.get("values", []) or []
-    except Exception as e:
-        print(f"⚠️ Could not read Google Sheet tab {tab}: {e}")
-        return []
-
-
-def load_content_config() -> Dict[str, Any]:
-    """Loads CareStatements + MediaRules + CustomText from either Google Sheet (preferred) or local Excel."""
-    cfg: Dict[str, Any] = {"care": [], "media": [], "custom": []}
-    print(
-        f"Content config source={CONTENT_CONFIG_SOURCE} | "
-        f"sheet_id={'set' if GOOGLE_SHEET_ID else 'missing'} | "
-        f"service_account={'set' if GOOGLE_SERVICE_ACCOUNT_JSON else 'missing'}"
-    )
-
-    def normalize_header(h: str) -> str:
-        return normalize(str(h or ""))
-
-    def rows_to_dicts(rows: List[List[Any]]) -> List[Dict[str, Any]]:
-        if not rows:
-            return []
-        headers = [normalize_header(h) for h in rows[0]]
-        out: List[Dict[str, Any]] = []
-        for r in rows[1:]:
-            r = list(r) + [None] * max(0, len(headers) - len(r))
-            if not any(x is not None and str(x).strip() for x in r):
-                continue
-            d: Dict[str, Any] = {}
-            for h, v in zip(headers, r):
-                if h:
-                    d[h] = v
-            enabled = str(d.get("enabled", "true")).strip().lower()
-            if enabled in {"false", "0", "no", "n"}:
-                continue
-            out.append(d)
-        return out
-
-    # --- Google Sheet path (private online) ---
-    if CONTENT_CONFIG_SOURCE in {"auto", "google"} and GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON:
-        creds = _google_creds()
-        if creds:
-            cfg["care"] = rows_to_dicts(_read_google_sheet_tab(GOOGLE_SHEET_ID, "CareStatements", creds))
-            cfg["media"] = rows_to_dicts(_read_google_sheet_tab(GOOGLE_SHEET_ID, "MediaRules", creds))
-            cfg["custom"] = rows_to_dicts(_read_google_sheet_tab(GOOGLE_SHEET_ID, "CustomText", creds))
-            print(
-                f"Loaded Google config rows: "
-                f"care={len(cfg['care'])}, "
-                f"media={len(cfg['media'])}, "
-                f"custom={len(cfg['custom'])}"
-            )
-            print(f"Drive folder id={'set' if GOOGLE_DRIVE_FOLDER_ID else 'missing'}")
-
-            if cfg["care"] or cfg["media"] or cfg["custom"]:
-                return cfg
-            if CONTENT_CONFIG_SOURCE == "google":
-                print("⚠️ Google sheet returned no data; check tab names and sharing.")
-                return cfg
-
-    # --- Local Excel fallback ---
-    if not load_workbook:
-        return cfg
-    path = CONTENT_CONFIG_XLSX
-    if not os.path.exists(path):
-        return cfg
-
-    try:
-        wb = load_workbook(path, data_only=True)
-    except Exception as e:
-        print(f"⚠️ content_config.xlsx could not be read: {e}")
-        return cfg
-
-    def read_sheet(name: str) -> List[Dict[str, Any]]:
-        if name not in wb.sheetnames:
-            return []
-        ws = wb[name]
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
-        return rows_to_dicts(rows)
-
-    cfg["care"] = read_sheet("CareStatements")
-    cfg["media"] = read_sheet("MediaRules")
-    cfg["custom"] = read_sheet("CustomText")
-    return cfg
-
-
-_drive_service_cache = None
-_drive_file_id_cache: Dict[str, str] = {}
-
-
-def download_drive_media(name_or_id: str) -> Optional[str]:
-    """Download a file from the shared Drive folder into /tmp and return local path.
-    - name_or_id: either 'id:<fileId>' or a filename in the GOOGLE_DRIVE_FOLDER_ID folder.
-    """
-    global _drive_service_cache
-    if not (GOOGLE_DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
-        return None
-    creds = _google_creds()
-    if not creds or not build or not MediaIoBaseDownload:
-        return None
-
-    try:
-        if _drive_service_cache is None:
-            _drive_service_cache = build("drive", "v3", credentials=creds, cache_discovery=False)
-        svc = _drive_service_cache
-
-        key = name_or_id.strip()
-        file_id: Optional[str] = None
-        if key.lower().startswith("id:"):
-            file_id = key[3:].strip()
-        else:
-            if key in _drive_file_id_cache:
-                file_id = _drive_file_id_cache[key]
-            else:
-                q = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and name = '{key}' and trashed = false"
-                resp = svc.files().list(q=q, fields="files(id,name,mimeType)").execute()
-                files = resp.get("files", []) or []
-                if not files:
-                    print(f"⚠️ Drive media not found in folder: {key}")
-                    return None
-                file_id = files[0]["id"]
-                _drive_file_id_cache[key] = file_id
-
-        out_dir = "/tmp/tay_weather_media"
-        os.makedirs(out_dir, exist_ok=True)
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", key) if key and not key.lower().startswith("id:") else (file_id or "drive_file")
-        out_path = os.path.join(out_dir, safe_name)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            return out_path
-
-        request = svc.files().get_media(fileId=file_id)
-        with open(out_path, "wb") as f:
-            downloader = MediaIoBaseDownload(f, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-        return out_path
-    except Exception as e:
-        print(f"⚠️ Could not download Drive media {name_or_id}: {e}")
-        return None
-
-
-def pick_care_statement(cfg: Dict[str, Any], meta: Dict[str, str], seed: str) -> str:
-    rows = cfg.get("care") or []
-    matched: List[Dict[str, Any]] = []
-    for r in rows:
-        if _matches(str(r.get("colour", "*")), meta.get("colour", "")) and _matches(str(r.get("level", "*")), meta.get("level", "")) and _matches(str(r.get("type", "*")), meta.get("type", "")):
-            matched.append({
-                "colour": r.get("colour"),
-                "level": r.get("level"),
-                "type": r.get("type"),
-                "weight": r.get("weight", 1),
-                "statement": (r.get("statement") or "").strip(),
-            })
-    choice = _weighted_choice(matched, seed)
-    return (choice.get("statement") or "").strip() if choice else ""
-
-
-def pick_media_refs(cfg: Dict[str, Any], meta: Dict[str, str], seed: str) -> List[Dict[str, str]]:
-    """Returns list of media dicts: {kind, ref}."""
-    rows = cfg.get("media") or []
-    matched: List[Dict[str, Any]] = []
-
-    for r in rows:
-        if _matches(str(r.get("colour", "*")), meta.get("colour", "")) and \
-           _matches(str(r.get("level", "*")), meta.get("level", "")) and \
-           _matches(str(r.get("type", "*")), meta.get("type", "")):
-
-            kind = normalize(str(r.get("media_kind") or "")) or "local"
-
-            # Support Canadian/Drive columns
-            ref = (r.get("media_ref") or "").strip()
-            if not ref:
-                # If file ID provided, use id:<fileId> form
-                fid = (r.get("drive_file_id") or "").strip()
-                fname = (r.get("drive_filename") or "").strip()
-                if fid:
-                    ref = f"id:{fid}"
-                elif fname:
-                    ref = fname
-
-            if ref:
-                matched.append({
-                    "colour": r.get("colour"),
-                    "level": r.get("level"),
-                    "type": r.get("type"),
-                    "weight": r.get("weight", 1),
-                    "kind": kind,
-                    "ref": ref,
-                })
-
-    choice = _weighted_choice(matched, seed)
-    if not choice:
-        return []
-    return [{"kind": str(choice.get("kind") or "local"), "ref": str(choice.get("ref") or "")}]
-
-
-def pick_custom_text(cfg: Dict[str, Any], now: dt.datetime, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Returns {mode, message, one_shot} if a custom override is currently enabled."""
-    rows = cfg.get("custom") or []
-    for r in rows:
-        enabled = str(r.get("enabled", "false")).strip().lower()
-        if enabled in {"false", "0", "no", "n", ""}:
-            continue
-        mode = normalize(str(r.get("mode") or "append")) or "append"
-        message = (r.get("message") or "").strip()
-        if not message:
-            continue
-
-        def parse_dt(x: Any) -> Optional[dt.datetime]:
-            s = (str(x or "")).strip()
-            if not s:
-                return None
-            try:
-                d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-                return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
-            except Exception:
-                return None
-
-        start = parse_dt(r.get("starts_utc") or r.get("start_utc"))
-        end = parse_dt(r.get("ends_utc") or r.get("end_utc"))
-
-        if start and now < start:
-            continue
-        if end and now > end:
-            continue
-
-        one_shot = str(r.get("one_shot", "false")).strip().lower() in {"true", "1", "yes", "y"}
-        if one_shot:
-            used = set(state.get("custom_one_shots_used", []) or [])
-            mh = text_hash(message)
-            if mh in used:
-                continue
-
-        return {"mode": mode, "message": message, "one_shot": one_shot}
-    return None
-
-
 def text_hash(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
@@ -564,11 +147,6 @@ def load_state() -> dict:
         "posted_text_hashes": [],
         "cooldowns": {},
         "global_last_post_ts": 0,
-        "telegram_last_update_id": 0,
-        "pending_approvals": {},
-        "approval_decisions": {},
-        "token_to_guid": {},
-        "custom_one_shots_used": [],
     }
     if not os.path.exists(STATE_PATH):
         return default
@@ -588,11 +166,6 @@ def load_state() -> dict:
     data.setdefault("posted_text_hashes", [])
     data.setdefault("cooldowns", {})
     data.setdefault("global_last_post_ts", 0)
-    data.setdefault("telegram_last_update_id", 0)
-    data.setdefault("pending_approvals", {})
-    data.setdefault("approval_decisions", {})
-    data.setdefault("token_to_guid", {})
-    data.setdefault("custom_one_shots_used", [])
     return data
 
 
@@ -605,22 +178,6 @@ def save_state(state: dict) -> None:
     if isinstance(cds, dict) and len(cds) > 5000:
         items = sorted(cds.items(), key=lambda kv: kv[1], reverse=True)[:4000]
         state["cooldowns"] = dict(items)
-
-    # Prune telegram approval state to keep state.json small
-    if isinstance(state.get("approval_decisions"), dict) and len(state["approval_decisions"]) > 1000:
-        items = sorted(
-            state["approval_decisions"].items(),
-            key=lambda kv: safe_int((kv[1] or {}).get("ts", 0), 0),
-            reverse=True,
-        )[:600]
-        state["approval_decisions"] = dict(items)
-    if isinstance(state.get("pending_approvals"), dict) and len(state["pending_approvals"]) > 1000:
-        items = sorted(
-            state["pending_approvals"].items(),
-            key=lambda kv: safe_int((kv[1] or {}).get("created_ts", 0), 0),
-            reverse=True,
-        )[:600]
-        state["pending_approvals"] = dict(items)
 
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -702,44 +259,18 @@ def atom_entry_guid(entry: Dict[str, Any]) -> str:
     return (entry.get("id") or entry.get("link") or entry.get("title") or "").strip()
 
 
-def build_social_text_from_atom(
-    entry: Dict[str, Any],
-    care_statement: str = "",
-    custom: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Builds X/Facebook text.
-
-    If custom.mode is "replace", the custom text replaces the generated copy.
-    If custom.mode is "append", the custom text is appended.
-    """
+def build_social_text_from_atom(entry: Dict[str, Any]) -> str:
     title = atom_title_for_tay((entry.get("title") or "").strip())
     issued = (entry.get("summary") or "").strip()
 
     sev = severity_emoji(title)
+    parts = [f"{sev} {title}"]
+    if issued:
+        parts.append(issued)
+    parts.append(f"More: {MORE_INFO_URL}")
+    parts.append("#TayTownship #ONStorm")
 
-    mode = normalize(str((custom or {}).get("mode") or "append")) if custom else "append"
-    custom_msg = (custom or {}).get("message") if custom else ""
-    custom_msg = (custom_msg or "").strip()
-
-    if custom_msg and mode == "replace":
-        parts = [custom_msg]
-    else:
-        parts = [f"{sev} {title}"]
-        if issued:
-            parts.append(issued)
-        if care_statement:
-            parts.append(care_statement)
-        if custom_msg and mode == "append":
-            parts.append(custom_msg)
-
-    # Always include a stable link + hashtags unless the custom message already includes them
-    if MORE_INFO_URL and not any("more:" in normalize(p) for p in parts):
-        parts.append(f"More: {MORE_INFO_URL}")
-    tags = "#TayTownship #ONStorm"
-    if not any("#taytownship" in normalize(p) for p in parts):
-        parts.append(tags)
-
-    text = " | ".join([p for p in parts if str(p).strip()])
+    text = " | ".join([p for p in parts if p])
     return text if len(text) <= 280 else (text[:277].rstrip() + "…")
 
 
@@ -1038,41 +569,25 @@ def get_oauth2_access_token() -> str:
 # X media upload helpers (OAuth 1.0a)
 # ----------------------------
 
-def load_image_bytes(image_ref: str) -> Tuple[bytes, str]:
-    """Loads an image from a URL or a local file path.
+def download_image_bytes(image_url: str) -> Tuple[bytes, str]:
+    image_url = (image_url or "").strip()
+    if not image_url:
+        raise RuntimeError("No image_url provided")
 
-    - URL: http(s)://...
-    - Local: relative path in the repo (e.g., media/wind.png)
-    """
-    image_ref = (image_ref or "").strip()
-    if not image_ref:
-        raise RuntimeError("No image reference provided")
+    r = requests.get(image_url, headers={"User-Agent": USER_AGENT}, timeout=(10, 30), allow_redirects=True)
+    r.raise_for_status()
 
-    if re.match(r"^https?://", image_ref, flags=re.IGNORECASE):
-        r = requests.get(image_ref, headers={"User-Agent": USER_AGENT}, timeout=(10, 30), allow_redirects=True)
-        r.raise_for_status()
+    content_type = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if not content_type.startswith("image/"):
+        raise RuntimeError(f"URL did not return an image. Content-Type={content_type}")
 
-        content_type = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if not content_type.startswith("image/"):
-            raise RuntimeError(f"URL did not return an image. Content-Type={content_type}")
-        return r.content, content_type
-
-    # Local file
-    local_path = image_ref
-    if not os.path.isabs(local_path):
-        local_path = os.path.join(os.getcwd(), local_path)
-    if not os.path.exists(local_path):
-        raise RuntimeError(f"Local image not found: {image_ref}")
-
-    data = open(local_path, "rb").read()
-    ct, _ = mimetypes.guess_type(local_path)
-    ct = (ct or "image/png").lower()
-    if not ct.startswith("image/"):
-        ct = "image/png"
-    return data, ct
+    return r.content, content_type
 
 
-def x_upload_media(image_ref: str) -> str:
+# Wire Facebook poster image loader (used only if non-URL refs are passed)
+fb.load_image_bytes = download_image_bytes
+
+def x_upload_media(image_url: str) -> str:
     api_key = os.getenv("X_API_KEY", "").strip()
     api_secret = os.getenv("X_API_SECRET", "").strip()
     access_token = os.getenv("X_ACCESS_TOKEN", "").strip()
@@ -1087,7 +602,7 @@ def x_upload_media(image_ref: str) -> str:
     if missing:
         raise RuntimeError(f"Missing required X OAuth1 env vars: {', '.join(missing)}")
 
-    img_bytes, mime_type = load_image_bytes(image_ref)
+    img_bytes, mime_type = download_image_bytes(image_url)
 
     auth = OAuth1(api_key, api_secret, access_token, access_secret)
     upload_url = "https://upload.twitter.com/1.1/media/upload.json"
@@ -1157,41 +672,6 @@ def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> Dict[str, An
 # Facebook Page posting helpers
 # ----------------------------
 
-def _fb_debug_response(r: requests.Response, label: str) -> None:
-    """Print useful debug info for Facebook Graph API failures."""
-    try:
-        print(f"{label} status:", r.status_code)
-    except Exception:
-        pass
-
-    if r.status_code < 400:
-        return
-
-    # Raw body (most useful in Actions logs)
-    try:
-        print("FB error body:", r.text)
-    except Exception:
-        pass
-
-    # Structured error (when JSON)
-    try:
-        j = r.json() or {}
-        err = j.get("error") or {}
-        if err:
-            print(
-                "FB error parsed:",
-                {
-                    "message": err.get("message"),
-                    "type": err.get("type"),
-                    "code": err.get("code"),
-                    "error_subcode": err.get("error_subcode"),
-                    "fbtrace_id": err.get("fbtrace_id"),
-                },
-            )
-    except Exception:
-        pass
-
-
 def post_to_facebook_page(message: str) -> Dict[str, Any]:
     page_id = os.getenv("FB_PAGE_ID", "").strip()
     page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
@@ -1199,258 +679,93 @@ def post_to_facebook_page(message: str) -> Dict[str, Any]:
         raise RuntimeError("Missing FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN")
 
     url = f"https://graph.facebook.com/v24.0/{page_id}/feed"
-    r = requests.post(
-        url,
-        data={"message": message, "access_token": page_token},
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-    )
-
-    _fb_debug_response(r, "FB POST /feed")
+    r = requests.post(url, data={"message": message, "access_token": page_token}, timeout=30)
+    print("FB POST /feed status:", r.status_code)
     if r.status_code >= 400:
         raise RuntimeError(f"Facebook feed post failed {r.status_code}")
     return r.json()
 
 
-def post_photo_to_facebook_page(caption: str, image_ref: str) -> Dict[str, Any]:
+def post_photo_to_facebook_page(caption: str, image_url: str) -> Dict[str, Any]:
     page_id = os.getenv("FB_PAGE_ID", "").strip()
     page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
     if not page_id or not page_token:
         raise RuntimeError("Missing FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN")
-    if not image_ref:
-        raise RuntimeError("Missing image_ref for FB photo post")
+    if not image_url:
+        raise RuntimeError("Missing image_url for FB photo post")
 
     url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
-
-    if re.match(r"^https?://", image_ref, flags=re.IGNORECASE):
-        r = requests.post(
-            url,
-            data={
-                "url": image_ref,
-                "caption": caption,
-                "access_token": page_token,
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=30,
-        )
-    else:
-        img_bytes, mime_type = load_image_bytes(image_ref)
-        r = requests.post(
-            url,
-            data={"caption": caption, "access_token": page_token},
-            files={"source": ("image", img_bytes, mime_type)},
-            headers={"User-Agent": USER_AGENT},
-            timeout=30,
-        )
-
-    _fb_debug_response(r, "FB POST /photos")
+    r = requests.post(
+        url,
+        data={
+            "url": image_url,
+            "caption": caption,
+            "access_token": page_token,
+        },
+        timeout=30,
+    )
+    print("FB POST /photos status:", r.status_code)
     if r.status_code >= 400:
         raise RuntimeError(f"Facebook photo post failed {r.status_code}")
     return r.json()
 
 
-def safe_post_facebook_with_limits(
-    caption: str,
-    image_urls: List[str],
-    *,
-    has_new_social_event: bool,
-    state_path: str = "state.json",
-    cooldown_seconds: int = 5400,   # 90 minutes (safe)
-    block_seconds: int = 21600,     # 6 hours
-) -> Dict[str, Any]:
-    """
-    - If no new social event: skip
-    - If within cooldown: skip
-    - If FB blocked us recently: skip
-    - Try carousel -> single photo -> text
-    - If FB rate-limits (code 368): set blocked_until and skip (do NOT crash job)
-    """
-    state = load_state(state_path)
-    now = dt.datetime.now(dt.timezone.utc)
+def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[str, Any]:
+    """Posts up to 10 images as a single carousel post."""
+    image_urls = [u for u in (image_urls or []) if (u or "").strip()]
 
-    def iso(t: dt.datetime) -> str:
-        return t.isoformat().replace("+00:00", "Z")
+    if not image_urls:
+        return post_to_facebook_page(caption)
 
-    def parse_iso(s: str) -> Optional[dt.datetime]:
+    if len(image_urls) == 1:
+        return post_photo_to_facebook_page(caption, image_urls[0])
+
+    page_id = os.getenv("FB_PAGE_ID", "").strip()
+    page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
+    if not page_id or not page_token:
+        raise RuntimeError("Missing FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN")
+
+    media_fbids: List[str] = []
+
+    for u in image_urls[:10]:
         try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            return dt.datetime.fromisoformat(s)
-        except Exception:
-            return None
-
-    if not has_new_social_event:
-        print("FB: skip (no new event)")
-        return {"skipped": True, "reason": "no_new_event"}
-
-    blocked_until = parse_iso(str(state.get("fb_blocked_until", ""))) if state.get("fb_blocked_until") else None
-    if blocked_until and now < blocked_until:
-        print(f"FB: skip (blocked until {state['fb_blocked_until']})")
-        return {"skipped": True, "reason": "blocked", "blocked_until": state["fb_blocked_until"]}
-
-    last_ok = parse_iso(str(state.get("fb_last_posted_at", ""))) if state.get("fb_last_posted_at") else None
-    if last_ok and (now - last_ok).total_seconds() < cooldown_seconds:
-        print(f"FB: skip (cooldown {cooldown_seconds}s)")
-        return {"skipped": True, "reason": "cooldown"}
-
-    def is_rate_limit(resp: requests.Response) -> bool:
-        try:
-            j = resp.json()
-            err = (j or {}).get("error", {}) or {}
-            return (resp.status_code >= 400 and err.get("code") == 368 and str(err.get("error_subcode")) == "1390008")
-        except Exception:
-            return False
-
-    def record_success():
-        state["fb_last_posted_at"] = iso(now)
-        state.pop("fb_blocked_until", None)
-        save_state(state, state_path)
-
-    def record_block():
-        until = now + dt.timedelta(seconds=block_seconds)
-        state["fb_blocked_until"] = iso(until)
-        save_state(state, state_path)
-
-    # 1) Try carousel
-    try:
-        result = post_carousel_to_facebook_page(caption, image_urls)
-        record_success()
-        return {"ok": True, "mode": "carousel", "result": result}
-    except Exception as e:
-        resp = getattr(e, "response", None)
-        if isinstance(resp, requests.Response) and is_rate_limit(resp):
-            print("⚠️ FB rate-limited (368). Blocking FB and skipping.")
-            record_block()
-            return {"skipped": True, "reason": "rate_limited"}
-        print(f"⚠️ FB carousel failed: {e}. Trying single photo...")
-
-    # 2) Try single photo
-    try:
-        if image_urls:
-            result = post_photo_to_facebook_page(caption, image_urls[0])
-            record_success()
-            return {"ok": True, "mode": "single_photo", "result": result}
-    except Exception as e:
-        resp = getattr(e, "response", None)
-        if isinstance(resp, requests.Response) and is_rate_limit(resp):
-            print("⚠️ FB rate-limited (368). Blocking FB and skipping.")
-            record_block()
-            return {"skipped": True, "reason": "rate_limited"}
-        print(f"⚠️ FB single photo failed: {e}. Trying text-only...")
-
-    # 3) Try text-only
-    try:
-        result = post_to_facebook_page(caption)
-        record_success()
-        return {"ok": True, "mode": "text", "result": result}
-    except Exception as e:
-        resp = getattr(e, "response", None)
-        if isinstance(resp, requests.Response) and is_rate_limit(resp):
-            print("⚠️ FB rate-limited (368). Blocking FB and skipping.")
-            record_block()
-            return {"skipped": True, "reason": "rate_limited"}
-        print(f"⚠️ FB text-only failed too: {e}. Skipping FB.")
-        return {"skipped": True, "reason": "failed_all_modes"}
-
-
-# ----------------------------
-# Telegram approval gate (optional)
-# ----------------------------
-
-def _telegram_enabled() -> bool:
-    return ENABLE_TELEGRAM_APPROVAL and bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-
-
-def telegram_api(method: str, **kwargs: Any) -> Dict[str, Any]:
-    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    url = f"{base}/{method}"
-    r = requests.post(url, json=kwargs, timeout=15)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Telegram {method} failed {r.status_code}")
-    j = r.json()
-    if not j.get("ok"):
-        raise RuntimeError(f"Telegram {method} not ok")
-    return j
-
-
-def telegram_send_preview(token: str, text: str) -> None:
-    if not _telegram_enabled():
-        return
-    markup = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ GO", "callback_data": f"GO:{token}"},
-                {"text": "❌ NO", "callback_data": f"NO:{token}"},
-            ]
-        ]
-    }
-    telegram_api(
-        "sendMessage",
-        chat_id=TELEGRAM_CHAT_ID,
-        text=f"Preview ({token})\n\n{text}",
-        reply_markup=markup,
-        disable_web_page_preview=False,
-    )
-
-
-def telegram_poll_and_record(state: Dict[str, Any]) -> None:
-    """Polls Telegram updates and records GO/NO decisions into state."""
-    if not _telegram_enabled():
-        return
-
-    last = safe_int(state.get("telegram_last_update_id", 0), 0)
-    start = time.time()
-    while time.time() - start < max(1, TELEGRAM_POLL_SECONDS):
-        try:
-            base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-            params = {"timeout": 0, "allowed_updates": ["callback_query", "message"]}
-            if last:
-                params["offset"] = last + 1
-            r = requests.get(f"{base}/getUpdates", params=params, timeout=15)
-            r.raise_for_status()
+            url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
+            r = requests.post(
+                url,
+                data={
+                    "url": u,
+                    "published": "false",
+                    "access_token": page_token,
+                },
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                print(f"⚠️ FB carousel upload failed for one image: {r.status_code}")
+                continue
             j = r.json()
-            if not j.get("ok"):
-                return
-            updates = j.get("result") or []
-            if not updates:
-                return
-
-            for upd in updates:
-                uid = safe_int(upd.get("update_id", 0), 0)
-                if uid:
-                    last = max(last, uid)
-
-                # Inline button clicks
-                cq = upd.get("callback_query") or {}
-                data = (cq.get("data") or "").strip()
-                if data.startswith("GO:") or data.startswith("NO:"):
-                    decision = "go" if data.startswith("GO:") else "no"
-                    tok = data.split(":", 1)[1].strip()
-                    if tok:
-                        state.setdefault("approval_decisions", {})
-                        state["approval_decisions"][tok] = {"decision": decision, "ts": int(time.time())}
-                    # Acknowledge click
-                    try:
-                        telegram_api("answerCallbackQuery", callback_query_id=cq.get("id"))
-                    except Exception:
-                        pass
-                    continue
-
-                # Text replies: "GO <token>" or "NO <token>"
-                msg = upd.get("message") or {}
-                txt = (msg.get("text") or "").strip()
-                m = re.match(r"^(go|no)\s+([a-f0-9]{6,16})$", txt, flags=re.IGNORECASE)
-                if m:
-                    decision = "go" if m.group(1).lower() == "go" else "no"
-                    tok = m.group(2).lower()
-                    state.setdefault("approval_decisions", {})
-                    state["approval_decisions"][tok] = {"decision": decision, "ts": int(time.time())}
-
-            state["telegram_last_update_id"] = last
-            return
+            fbid = j.get("id")
+            if fbid:
+                media_fbids.append(str(fbid))
         except Exception as e:
-            print(f"⚠️ Telegram poll failed: {e}")
-            return
+            print(f"⚠️ FB carousel upload skipped for one image: {e}")
+
+    if not media_fbids:
+        return post_to_facebook_page(caption)
+
+    if len(media_fbids) == 1:
+        return post_photo_to_facebook_page(caption, image_urls[0])
+
+    data: Dict[str, Any] = {"message": caption, "access_token": page_token}
+    for i, fbid in enumerate(media_fbids):
+        data[f"attached_media[{i}]"] = json.dumps({"media_fbid": fbid})
+
+    feed_url = f"https://graph.facebook.com/v24.0/{page_id}/feed"
+    r = requests.post(feed_url, data=data, timeout=30)
+    print("FB POST /feed (carousel) status:", r.status_code)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Facebook carousel post failed {r.status_code}")
+
+    return r.json()
 
 
 # ----------------------------
@@ -1472,37 +787,18 @@ def main() -> None:
         if ENABLE_X_POSTING:
             post_to_x(text, image_urls=camera_image_urls)
         if ENABLE_FB_POSTING:
-            state = load_state()
-            try:
-                fb_result = fb.safe_post_facebook(
-                    state,
-                    caption=text,
-                    image_urls=camera_image_urls,
-                    has_new_social_event=True,
-                    state_path=STATE_PATH,
-                )
-                print("FB result:", fb_result)
-            except Exception as e:
-                print(f"⚠️ Facebook posting encountered an unexpected error; skipping: {e}")
+            fb_state = fb.load_state("state.json")
+            fb_result = fb.safe_post_facebook(
+                fb_state,
+                caption=text,
+                image_urls=camera_image_urls,
+                has_new_social_event=True,
+                state_path="state.json",
+            )
+            print("FB result:", fb_result)
         return
 
     state = load_state()
-
-    # Pull in any approval decisions first (so an approved post can go out on this run)
-    telegram_poll_and_record(state)
-
-    # Load Excel-backed content (care statements, media rules, optional custom text)
-    cfg = load_content_config()
-    current_custom = pick_custom_text(cfg, now_utc(), state)
-
-    # Prune very old pending approvals
-    if isinstance(state.get("pending_approvals"), dict):
-        ttl_s = max(1, TELEGRAM_APPROVAL_TTL_HOURS) * 3600
-        cutoff = int(time.time()) - ttl_s
-        state["pending_approvals"] = {
-            k: v for k, v in state.get("pending_approvals", {}).items()
-            if safe_int((v or {}).get("created_ts", 0), 0) >= cutoff
-        }
     posted = set(state.get("posted_guids", []))
     posted_text_hashes = set(state.get("posted_text_hashes", []))
 
@@ -1524,25 +820,6 @@ def main() -> None:
         if not guid:
             continue
 
-        meta = alert_meta_from_title((entry.get("title") or ""))
-        care_statement = pick_care_statement(cfg, meta, seed=guid)
-        media_rule = pick_media_refs(cfg, meta, seed=guid)
-
-        chosen_images: List[str] = []
-        if media_rule:
-            kind = normalize(str(media_rule[0].get("kind") or ""))
-            ref = (media_rule[0].get("ref") or "").strip()
-            if kind == "cameras":
-                chosen_images = camera_image_urls
-            elif kind in {"drive", "gdrive", "google_drive"} and ref:
-                dl = download_drive_media(ref)
-                if dl:
-                    chosen_images = [dl]
-            elif ref:
-                chosen_images = [ref]
-        if not chosen_images:
-            chosen_images = camera_image_urls
-
         title = atom_title_for_tay((entry.get("title") or "Weather alert").strip())
         pub_dt = entry.get("updated_dt") or dt.datetime.now(dt.timezone.utc)
         pub_date = email.utils.format_datetime(pub_dt)
@@ -1562,7 +839,7 @@ def main() -> None:
             print("Social skipped:", reason)
             continue
 
-        social_text = build_social_text_from_atom(entry, care_statement=care_statement, custom=current_custom)
+        social_text = build_social_text_from_atom(entry)
         h = text_hash(social_text)
 
         if h in posted_text_hashes:
@@ -1573,39 +850,11 @@ def main() -> None:
 
         print("Social preview:", social_text.replace("\n", " "))
 
-        # Optional GO/NO-GO approval via Telegram
-        if _telegram_enabled():
-            token = hashlib.sha1(guid.encode("utf-8")).hexdigest()[:10]
-            state.setdefault("token_to_guid", {})
-            state["token_to_guid"][token] = guid
-
-            decisions = state.get("approval_decisions", {}) if isinstance(state.get("approval_decisions"), dict) else {}
-            decision = (decisions.get(token) or {}).get("decision")
-
-            if decision == "no":
-                print(f"Telegram decision=NO for {token}; skipping social post.")
-                posted.add(guid)
-                state.get("pending_approvals", {}).pop(token, None)
-                continue
-
-            if decision != "go":
-                # Not yet approved → send preview once and defer posting
-                state.setdefault("pending_approvals", {})
-                if token not in state["pending_approvals"]:
-                    telegram_send_preview(token, social_text)
-                    state["pending_approvals"][token] = {
-                        "guid": guid,
-                        "created_ts": int(time.time()),
-                    }
-                else:
-                    print(f"Awaiting Telegram approval for {token}")
-                continue
-
         posted_anywhere = False
 
         if ENABLE_X_POSTING:
             try:
-                post_to_x(social_text, image_urls=chosen_images)
+                post_to_x(social_text, image_urls=camera_image_urls)
                 posted_anywhere = True
             except RuntimeError as e:
                 if str(e) == "X_DUPLICATE_TWEET":
@@ -1614,36 +863,22 @@ def main() -> None:
                     raise
 
         if ENABLE_FB_POSTING:
-            try:
-                fb_result = fb.safe_post_facebook(
-                    state,
-                    caption=social_text,
-                    image_urls=chosen_images,
-                    has_new_social_event=True,
-                    state_path=STATE_PATH,
-                )
-                print("FB result:", fb_result)
-                if fb_result.get("posted"):
-                    posted_anywhere = True
-            except Exception as e:
-                print(f"⚠️ Facebook posting encountered an unexpected error; skipping: {e}")
+            fb_result = fb.safe_post_facebook(
+                state,
+                caption=social_text,
+                image_urls=camera_image_urls,
+                has_new_social_event=True,
+                state_path="state.json",
+            )
+            print("FB result:", fb_result)
+            if fb_result.get("ok"):
+                posted_anywhere = True
 
         if posted_anywhere:
             social_posted += 1
             posted.add(guid)
             posted_text_hashes.add(h)
             mark_posted(state, DISPLAY_AREA_NAME, kind="alert")
-
-            # Mark one-shot custom text as used once it actually goes out
-            if current_custom and current_custom.get("one_shot"):
-                state.setdefault("custom_one_shots_used", [])
-                state["custom_one_shots_used"].append(text_hash(current_custom.get("message") or ""))
-
-            # Clear pending approval state
-            if _telegram_enabled():
-                tok = hashlib.sha1(guid.encode("utf-8")).hexdigest()[:10]
-                if isinstance(state.get("pending_approvals"), dict):
-                    state["pending_approvals"].pop(tok, None)
         else:
             print("No social posts sent for this alert.")
 
