@@ -82,9 +82,21 @@ STATE_PATH = "state.json"
 RSS_PATH = "tay-weather.xml"
 ROTATED_X_REFRESH_TOKEN_PATH = "x_refresh_token_rotated.txt"
 
-# Content configuration workbook (commit this to the repo)
+# Content configuration source:
+# - "google": load from Google Sheet
+# - "xlsx": load from local Excel file in repo
+# - "auto": prefer Google if secrets exist, else fall back to xlsx
 CONTENT_CONFIG_XLSX = os.getenv("CONTENT_CONFIG_XLSX", "content_config.xlsx").strip() or "content_config.xlsx"
+CONTENT_CONFIG_SOURCE = os.getenv("CONTENT_CONFIG_SOURCE", "auto").strip().lower()
+if CONTENT_CONFIG_SOURCE not in {"auto", "google", "xlsx"}:
+    CONTENT_CONFIG_SOURCE = "auto"
 
+# Google private config + media (from GitHub Secrets)
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    
 # Optional: Telegram approval (GO/NO-GO) gate
 ENABLE_TELEGRAM_APPROVAL = os.getenv("ENABLE_TELEGRAM_APPROVAL", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -311,6 +323,11 @@ def _read_google_sheet_tab(sheet_id: str, tab: str, creds) -> List[List[Any]]:
 def load_content_config() -> Dict[str, Any]:
     """Loads CareStatements + MediaRules + CustomText from either Google Sheet (preferred) or local Excel."""
     cfg: Dict[str, Any] = {"care": [], "media": [], "custom": []}
+    print(
+        f"Content config source={CONTENT_CONFIG_SOURCE} | "
+        f"sheet_id={'set' if GOOGLE_SHEET_ID else 'missing'} | "
+        f"service_account={'set' if GOOGLE_SERVICE_ACCOUNT_JSON else 'missing'}"
+    )
 
     def normalize_header(h: str) -> str:
         return normalize(str(h or ""))
@@ -341,6 +358,14 @@ def load_content_config() -> Dict[str, Any]:
             cfg["care"] = rows_to_dicts(_read_google_sheet_tab(GOOGLE_SHEET_ID, "CareStatements", creds))
             cfg["media"] = rows_to_dicts(_read_google_sheet_tab(GOOGLE_SHEET_ID, "MediaRules", creds))
             cfg["custom"] = rows_to_dicts(_read_google_sheet_tab(GOOGLE_SHEET_ID, "CustomText", creds))
+            print(
+                f"Loaded Google config rows: "
+                f"care={len(cfg['care'])}, "
+                f"media={len(cfg['media'])}, "
+                f"custom={len(cfg['custom'])}"
+            )
+            print(f"Drive folder id={'set' if GOOGLE_DRIVE_FOLDER_ID else 'missing'}")
+
             if cfg["care"] or cfg["media"] or cfg["custom"]:
                 return cfg
             if CONTENT_CONFIG_SOURCE == "google":
@@ -449,10 +474,25 @@ def pick_media_refs(cfg: Dict[str, Any], meta: Dict[str, str], seed: str) -> Lis
     """Returns list of media dicts: {kind, ref}."""
     rows = cfg.get("media") or []
     matched: List[Dict[str, Any]] = []
+
     for r in rows:
-        if _matches(str(r.get("colour", "*")), meta.get("colour", "")) and _matches(str(r.get("level", "*")), meta.get("level", "")) and _matches(str(r.get("type", "*")), meta.get("type", "")):
+        if _matches(str(r.get("colour", "*")), meta.get("colour", "")) and \
+           _matches(str(r.get("level", "*")), meta.get("level", "")) and \
+           _matches(str(r.get("type", "*")), meta.get("type", "")):
+
             kind = normalize(str(r.get("media_kind") or "")) or "local"
+
+            # Support Canadian/Drive columns
             ref = (r.get("media_ref") or "").strip()
+            if not ref:
+                # If file ID provided, use id:<fileId> form
+                fid = (r.get("drive_file_id") or "").strip()
+                fname = (r.get("drive_filename") or "").strip()
+                if fid:
+                    ref = f"id:{fid}"
+                elif fname:
+                    ref = fname
+
             if ref:
                 matched.append({
                     "colour": r.get("colour"),
@@ -462,6 +502,7 @@ def pick_media_refs(cfg: Dict[str, Any], meta: Dict[str, str], seed: str) -> Lis
                     "kind": kind,
                     "ref": ref,
                 })
+
     choice = _weighted_choice(matched, seed)
     if not choice:
         return []
@@ -490,8 +531,9 @@ def pick_custom_text(cfg: Dict[str, Any], now: dt.datetime, state: Dict[str, Any
             except Exception:
                 return None
 
-        start = parse_dt(r.get("start_utc"))
-        end = parse_dt(r.get("end_utc"))
+        start = parse_dt(r.get("starts_utc") or r.get("start_utc"))
+        end = parse_dt(r.get("ends_utc") or r.get("end_utc"))
+
         if start and now < start:
             continue
         if end and now > end:
