@@ -46,6 +46,12 @@ jobs:
           echo "CR29_NORTH_IMAGE_URL=${CR29_NORTH_IMAGE_URL}"
           echo "CR29_SOUTH_IMAGE_URL=${CR29_SOUTH_IMAGE_URL}"
           echo "TAY_ALERTS_URL=${TAY_ALERTS_URL}"
+          echo "CONTENT_CONFIG_SOURCE=${CONTENT_CONFIG_SOURCE}"
+          echo "CONTENT_CONFIG_XLSX=${CONTENT_CONFIG_XLSX}"
+          # Don't print Google secret values; just show whether set
+          if [ -n "${GOOGLE_SHEET_ID}" ]; then echo "GOOGLE_SHEET_ID=set"; else echo "GOOGLE_SHEET_ID=missing"; fi
+          if [ -n "${GOOGLE_SERVICE_ACCOUNT_JSON}" ]; then echo "GOOGLE_SERVICE_ACCOUNT_JSON=set"; else echo "GOOGLE_SERVICE_ACCOUNT_JSON=missing"; fi
+          if [ -n "${GOOGLE_DRIVE_FOLDER_ID}" ]; then echo "GOOGLE_DRIVE_FOLDER_ID=set"; else echo "GOOGLE_DRIVE_FOLDER_ID=missing"; fi
         env:
           ENABLE_X_POSTING: "true"
           ENABLE_FB_POSTING: "true"
@@ -53,7 +59,15 @@ jobs:
           CR29_NORTH_IMAGE_URL: ${{ vars.CR29_NORTH_IMAGE_URL }}
           CR29_SOUTH_IMAGE_URL: ${{ vars.CR29_SOUTH_IMAGE_URL }}
           TAY_ALERTS_URL: https://weatherpresenter.github.io/tay-weather-rss/tay/
-          
+
+          # Content config toggles
+          CONTENT_CONFIG_SOURCE: ${{ vars.CONTENT_CONFIG_SOURCE || 'auto' }}
+          CONTENT_CONFIG_XLSX: ${{ vars.CONTENT_CONFIG_XLSX || 'content_config.xlsx' }}
+
+          # Google (secrets) - safe check only (no printing)
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
 
       - name: Sanity check required secrets (fails fast)
         run: |
@@ -74,6 +88,16 @@ jobs:
             if [ -z "${!k}" ]; then echo "Missing secret: $k"; missing=1; fi
           done
 
+          # Google content config (optional, but required if you want Google source)
+          for k in GOOGLE_SHEET_ID GOOGLE_SERVICE_ACCOUNT_JSON; do
+            if [ -z "${!k}" ]; then echo "Missing secret: $k"; missing=1; fi
+          done
+
+          # Drive folder is optional unless you use Drive media
+          if [ -z "${GOOGLE_DRIVE_FOLDER_ID}" ]; then
+            echo "Missing secret: GOOGLE_DRIVE_FOLDER_ID (optional)"
+          fi
+
           if [ "$missing" -ne 0 ]; then
             echo "One or more required secrets are missing. Fix repo secrets and re-run."
             exit 1
@@ -89,12 +113,24 @@ jobs:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
 
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+
       - name: Run weather bot (RSS + socials)
         env:
           ALERT_FEED_URL: "https://weather.gc.ca/rss/battleboard/onrm94_e.xml"
           TAY_COORDS_URL: "https://weather.gc.ca/en/location/index.html?coords=44.751,-79.768"
           TAY_ALERTS_URL: "https://weatherpresenter.github.io/tay-weather-rss/tay/"
 
+          # Content configuration source
+          CONTENT_CONFIG_SOURCE: ${{ vars.CONTENT_CONFIG_SOURCE || 'auto' }}
+          CONTENT_CONFIG_XLSX: ${{ vars.CONTENT_CONFIG_XLSX || 'content_config.xlsx' }}
+
+          # Google private config + media
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
 
           # X OAuth 1.0a (required for media upload)
           X_API_KEY: ${{ secrets.X_API_KEY }}
@@ -115,12 +151,10 @@ jobs:
           CR29_NORTH_IMAGE_URL: ${{ vars.CR29_NORTH_IMAGE_URL }}
           CR29_SOUTH_IMAGE_URL: ${{ vars.CR29_SOUTH_IMAGE_URL }}
 
-
           # Toggles
           TEST_TWEET: ${{ github.event.inputs.test_tweet || 'false' }}
           ENABLE_X_POSTING: "true"
           ENABLE_FB_POSTING: "true"
-
         run: |
           python tay_weather_bot.py
 
