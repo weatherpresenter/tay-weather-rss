@@ -284,7 +284,7 @@ def extract_alert_text_blob_from_report_source(html: str) -> str:
         except Exception:
             return c.replace("\\n", "\n")
 
-    raise RuntimeError("Could not locate embedded alert text blob on report page")
+    return ""
 
 def parse_what_when_from_alert_text(alert_text: str) -> Tuple[List[str], str]:
     """
@@ -591,10 +591,22 @@ def main() -> None:
 
     report_url = extract_report_url_from_entry_content(entry_content or "")
 
+    # 🔍 Debug / audit log
+    safe_print(f"Report URL checked: {report_url}")
+    
     # Fetch warnings report page source
     report_html = fetch_text(report_url)
+
+    # ✅ Gracefully handle "no active alert" report pages
     alert_text = extract_alert_text_blob_from_report_source(report_html)
+    if not alert_text or not alert_text.strip():
+        safe_print("✅ No active alerts (report page has no embedded alert text). Nothing to post.")
+        return
+
     what_lines, when_line = parse_what_when_from_alert_text(alert_text)
+    if not what_lines and not when_line:
+        safe_print("✅ No active alerts (no What/When content). Nothing to post.")
+        return
 
     alert = AlertInfo(
         title=title,
