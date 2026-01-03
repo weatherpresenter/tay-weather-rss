@@ -2,6 +2,9 @@
   "seen_keys": [],
   "last_fb_post_ts": 0,
   "last_x_post_ts": 0,
-  "last_report_url": "",
-  "last_hash": ""
+  "last_report_url": "https://weather.gc.ca/warnings/report_e.html?onrm94",
+  "last_hash": "",
+  "last_issue_time_text": "3:55 AM local Sat 3 Jan 2026",
+  "last_event_name": "Snow Squall",
+  "last_run_utc": "2026-01-03T03:55:31Z"
 }
