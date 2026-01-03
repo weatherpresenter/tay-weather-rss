@@ -1,16 +1,17 @@
 # tay_weather_bot.py
 #
-# Tay Township Weather Bot (v2.2 - JSON-from-view-source EC parser)
+# Tay Township Weather Bot (v2.3 - robust EC JSON-from-view-source parser + X 403 soft-fail)
 # - Uses Environment Canada ATOM feed as the alert list (source of truth)
 # - For each entry, fetches the EC HTML alert page and extracts (from embedded JSON in page source):
-#     * headline (first paragraph in embedded "text")
+#     * headline (first paragraph in embedded alert text)
 #     * What lines (X up to 2, Facebook up to 3)
 #     * When line (first sentence)
 #     * care_text (from "Additional information:" / "Care:" / "Preparedness:" when present)
-#   Also extracts issued time (short) from page text as before.
+#   Also extracts issued time (short) from page text (as before).
 # - Posts to X + Facebook (optional toggles)
 # - X: hard 280 chars including spaces
 # - Facebook: includes fuller care statement (prefers EC care_text when available)
+# - IMPORTANT: headline line 1 always ends with "in Tay Township."
 #
 import base64
 import datetime as dt
@@ -47,7 +48,7 @@ WATERMARK_ON511 = os.getenv("WATERMARK_ON511", "true").lower() == "true"
 ON511_LOGO_PATH = os.getenv("ON511_LOGO_PATH", "assets/On511_logo.png").strip()
 WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.35"))  # 0..1
 
-USER_AGENT = "tay-weather-rss-bot/2.2"
+USER_AGENT = "tay-weather-rss-bot/2.3"
 
 # Public “more info” URL (prefer GitHub page)
 TAY_COORDS_URL = os.getenv(
@@ -311,24 +312,34 @@ def _html_to_text(html: str) -> str:
 
 def _extract_ec_embedded_text_from_page_source(html: str) -> str:
     """
-    Extract the embedded JSON string value for the alert "text" field from EC page source.
+    Robustly extract the *alert narrative* from EC page source.
 
-    In View Source you’ll see something like:
-      ..."text":"Snow squalls continue tonight.\n\nWhat:\n...","confidence":"High"...
-    We capture the raw JSON string content and json-decode it to turn \n into real newlines.
+    The page includes many UI "text":"..." fields. We find *all* occurrences of:
+      "text":"...","confidence":
+    decode each candidate, then pick the one that contains "What:" or "When:".
     """
     if not html:
         return ""
 
-    m = re.search(r'"text"\s*:\s*"(?P<raw>.*?)"\s*,\s*"confidence"', html, flags=re.DOTALL)
-    if not m:
-        return ""
+    for m in re.finditer(
+        r'"text"\s*:\s*"(?P<raw>.*?)"\s*,\s*"confidence"\s*:',
+        html,
+        flags=re.DOTALL,
+    ):
+        raw = m.group("raw")
+        try:
+            decoded = json.loads(f'"{raw}"')
+        except Exception:
+            decoded = raw.replace(r"\n", "\n").replace(r"\\", "\\")
 
-    raw = m.group("raw")
-    try:
-        return json.loads(f'"{raw}"')
-    except Exception:
-        return raw.replace(r"\n", "\n").replace(r"\\", "\\")
+        decoded = (decoded or "").strip()
+        if not decoded:
+            continue
+
+        if ("What:" in decoded) or ("When:" in decoded) or ("\n\nWhat:" in decoded):
+            return decoded
+
+    return ""
 
 
 def _first_sentence(text: str) -> str:
@@ -376,7 +387,7 @@ def _parse_ec_alert_text_sections(alert_text: str) -> Dict[str, Any]:
     """
     Parse the EC embedded alert text into sections.
 
-    Expected structure like:
+    Expected structure:
       Headline paragraph
 
       What:
@@ -450,7 +461,6 @@ def _parse_ec_alert_text_sections(alert_text: str) -> Dict[str, Any]:
             buf.append(b[len("Additional information:") :].strip())
             continue
 
-        # append continuation to current section if any
         if current:
             buf.append(b)
 
@@ -465,9 +475,9 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
     """
     Updated EC parser:
     - Fetch EC alert HTML
-    - Extract embedded JSON "text" field (View Source)
-    - Parse headline/what/when/care from that text
-    - Keep issued_short extraction (regex over page text) for your footer line
+    - Extract embedded JSON "text" field (View Source), robustly selecting the real alert narrative
+    - Parse headline/what/when/care from that narrative
+    - Keep issued_short extraction (regex over page text) for footer line
     """
     if not url:
         return {}
@@ -558,12 +568,10 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
     when_line = (details.get("when_line") or "").strip()
     issued_short = (details.get("issued_short") or "").strip()
 
-    # X care line(s) — progressively shorter fallbacks if we hit 280
     care_long = "Please take care, travel only if needed and check on neighbours who may need support."
     care_mid = "Please take care, travel only if needed and check on neighbours who may need support."
     care_short = "Please take care, travel only if needed."
 
-    # Line 1 (required format)
     if headline:
         h = headline[:-1] if headline.endswith(".") else headline
         line1 = f"{emoji} - {h} in Tay Township."
@@ -593,16 +601,15 @@ def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
             lines.append(HASHTAGS)
         return "\n".join([ln for ln in lines if ln]).strip()
 
-    # Priority: keep What+When. Drop issued before dropping core info.
     candidates = [
         compose(2, True, care_long, True, True),
-        compose(2, True, care_mid, False, True),     # drop issued
-        compose(2, True, care_short, False, True),   # shorter care
-        compose(1, True, care_short, False, True),   # drop 2nd what
-        compose(1, True, "", False, True),           # drop care if absolutely needed
-        compose(1, True, "", False, False),          # drop hashtags last resort
-        compose(0, True, "", False, False),          # when only
-        compose(0, False, "", False, False),         # absolute minimum
+        compose(2, True, care_mid, False, True),
+        compose(2, True, care_short, False, True),
+        compose(1, True, care_short, False, True),
+        compose(1, True, "", False, True),
+        compose(1, True, "", False, False),
+        compose(0, True, "", False, False),
+        compose(0, False, "", False, False),
     ]
 
     for t in candidates:
@@ -1039,12 +1046,15 @@ def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> Dict[str, An
         detail = ""
         try:
             j = r.json()
-            detail = (j.get("detail") or "").lower()
+            detail = (j.get("detail") or "")
         except Exception:
-            pass
+            detail = r.text or ""
 
-        if r.status_code == 403 and "duplicate" in detail:
+        if r.status_code == 403 and "duplicate" in detail.lower():
             raise RuntimeError("X_DUPLICATE_TWEET")
+
+        if r.status_code == 403 and "not permitted" in detail.lower():
+            raise RuntimeError("X_NOT_PERMITTED")
 
         raise RuntimeError(f"X post failed {r.status_code} {r.text}")
 
@@ -1144,6 +1154,87 @@ def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[
 
 
 # ----------------------------
+# RSS helpers (kept identical to your existing workflow)
+# ----------------------------
+def ensure_rss_exists() -> None:
+    if os.path.exists(RSS_PATH):
+        return
+
+    rss = ET.Element("rss", version="2.0")
+    channel = ET.SubElement(rss, "channel")
+
+    ET.SubElement(channel, "title").text = "Tay Township Weather Statements"
+    ET.SubElement(channel, "link").text = "https://weatherpresenter.github.io/tay-weather-rss/"
+    ET.SubElement(channel, "description").text = "Automated weather statements and alerts for Tay Township area."
+    ET.SubElement(channel, "language").text = "en-ca"
+
+    ET.ElementTree(rss).write(RSS_PATH, encoding="utf-8", xml_declaration=True)
+
+
+def load_rss_tree() -> Tuple[ET.ElementTree, ET.Element]:
+    ensure_rss_exists()
+    tree = ET.parse(RSS_PATH)
+    root = tree.getroot()
+    channel = root.find("channel")
+    if channel is None:
+        raise RuntimeError("RSS file missing <channel>")
+    return tree, channel
+
+
+def rss_item_exists(channel: ET.Element, guid_text: str) -> bool:
+    for item in channel.findall("item"):
+        guid = item.find("guid")
+        if guid is not None and (guid.text or "").strip() == guid_text:
+            return True
+    return False
+
+
+def add_rss_item(
+    channel: ET.Element,
+    title: str,
+    link: str,
+    guid: str,
+    pub_date: str,
+    description: str,
+) -> None:
+    item = ET.Element("item")
+    ET.SubElement(item, "title").text = title
+    ET.SubElement(item, "link").text = link
+    g = ET.SubElement(item, "guid")
+    g.text = guid
+    g.set("isPermaLink", "false")
+    ET.SubElement(item, "pubDate").text = pub_date
+    ET.SubElement(item, "description").text = description
+
+    insert_index = 0
+    for i, child in enumerate(list(channel)):
+        if child.tag in {"title", "link", "description", "language", "lastBuildDate"}:
+            insert_index = i + 1
+    channel.insert(insert_index, item)
+
+
+def trim_rss_items(channel: ET.Element, max_items: int) -> None:
+    items = channel.findall("item")
+    if len(items) <= max_items:
+        return
+    for item in items[max_items:]:
+        channel.remove(item)
+
+
+def build_rss_description_from_atom(entry: Dict[str, Any]) -> str:
+    title = (entry.get("title") or "").strip()
+    issued = (entry.get("summary") or "").strip()
+    official = (entry.get("link") or "").strip()
+    bits = [title]
+    if issued:
+        bits.append(issued)
+    bits.append(f"More info (Tay Township): {MORE_INFO_URL}")
+    if official:
+        bits.append(f"Official alert details: {official}")
+    return "\n".join(bits)
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main() -> None:
@@ -1159,9 +1250,15 @@ def main() -> None:
     if TEST_TWEET:
         text = "Test post from Tay weather bot ✅"
         if ENABLE_X_POSTING:
-            post_to_x(text, image_urls=camera_image_urls)
+            try:
+                post_to_x(text, image_urls=camera_image_urls)
+            except RuntimeError as e:
+                print(f"⚠️ X test post skipped: {e}")
         if ENABLE_FB_POSTING:
-            post_carousel_to_facebook_page(text, camera_image_urls)
+            try:
+                post_carousel_to_facebook_page(text, camera_image_urls)
+            except RuntimeError as e:
+                print(f"⚠️ FB test post skipped: {e}")
         return
 
     state = load_state()
@@ -1201,6 +1298,7 @@ def main() -> None:
         if guid in posted:
             continue
 
+        # Cooldown checks
         allowed, reason = cooldown_allows_post(state, DISPLAY_AREA_NAME, kind="alert")
         if not allowed:
             social_skipped_cooldown += 1
@@ -1238,8 +1336,10 @@ def main() -> None:
             except RuntimeError as e:
                 if str(e) == "X_DUPLICATE_TWEET":
                     print("X rejected duplicate tweet text, skipping.")
+                elif str(e) == "X_NOT_PERMITTED":
+                    print("⚠️ X not permitted (403). Skipping X, continuing with FB/RSS.")
                 else:
-                    raise
+                    print(f"⚠️ X post failed (soft): {e}")
 
         if ENABLE_FB_POSTING:
             try:
