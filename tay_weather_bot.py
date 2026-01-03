@@ -48,6 +48,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests_oauthlib import OAuth1
+import facebook_poster as fb
+fb.load_image_bytes = load_image_bytes  # reuse your existing function
 
 # Optional: Excel-backed content configuration
 try:
@@ -1246,102 +1248,109 @@ def post_photo_to_facebook_page(caption: str, image_ref: str) -> Dict[str, Any]:
     return r.json()
 
 
-def post_carousel_to_facebook_page(caption: str, image_urls: List[str]) -> Dict[str, Any]:
-    """Posts up to 10 images as a single carousel post.
-    Recommended behaviour:
-      - If carousel build/post fails, fall back to single photo (first image).
-      - If that fails too, fall back to plain text feed post.
+def safe_post_facebook_with_limits(
+    caption: str,
+    image_urls: List[str],
+    *,
+    has_new_social_event: bool,
+    state_path: str = "state.json",
+    cooldown_seconds: int = 5400,   # 90 minutes (safe)
+    block_seconds: int = 21600,     # 6 hours
+) -> Dict[str, Any]:
     """
-    image_urls = [u for u in (image_urls or []) if (u or "").strip()]
+    - If no new social event: skip
+    - If within cooldown: skip
+    - If FB blocked us recently: skip
+    - Try carousel -> single photo -> text
+    - If FB rate-limits (code 368): set blocked_until and skip (do NOT crash job)
+    """
+    state = load_state(state_path)
+    now = dt.datetime.now(dt.timezone.utc)
 
-    if not image_urls:
-        return post_to_facebook_page(caption)
+    def iso(t: dt.datetime) -> str:
+        return t.isoformat().replace("+00:00", "Z")
 
-    if len(image_urls) == 1:
-        return post_photo_to_facebook_page(caption, image_urls[0])
-
-    page_id = os.getenv("FB_PAGE_ID", "").strip()
-    page_token = os.getenv("FB_PAGE_ACCESS_TOKEN", "").strip()
-    if not page_id or not page_token:
-        raise RuntimeError("Missing FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN")
-
-    media_fbids: List[str] = []
-
-    # 1) Upload each photo as unpublished to get media IDs
-    for u in image_urls[:10]:
+    def parse_iso(s: str) -> Optional[dt.datetime]:
         try:
-            url = f"https://graph.facebook.com/v24.0/{page_id}/photos"
-            if re.match(r"^https?://", u, flags=re.IGNORECASE):
-                r = requests.post(
-                    url,
-                    data={
-                        "url": u,
-                        "published": "false",
-                        "access_token": page_token,
-                    },
-                    headers={"User-Agent": USER_AGENT},
-                    timeout=30,
-                )
-            else:
-                img_bytes, mime_type = load_image_bytes(u)
-                r = requests.post(
-                    url,
-                    data={
-                        "published": "false",
-                        "access_token": page_token,
-                    },
-                    files={"source": ("image", img_bytes, mime_type)},
-                    headers={"User-Agent": USER_AGENT},
-                    timeout=30,
-                )
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return dt.datetime.fromisoformat(s)
+        except Exception:
+            return None
 
-            if r.status_code >= 400:
-                _fb_debug_response(r, "FB carousel upload (one image)")
-                continue
+    if not has_new_social_event:
+        print("FB: skip (no new event)")
+        return {"skipped": True, "reason": "no_new_event"}
 
-            j = r.json()
-            fbid = j.get("id")
-            if fbid:
-                media_fbids.append(str(fbid))
+    blocked_until = parse_iso(str(state.get("fb_blocked_until", ""))) if state.get("fb_blocked_until") else None
+    if blocked_until and now < blocked_until:
+        print(f"FB: skip (blocked until {state['fb_blocked_until']})")
+        return {"skipped": True, "reason": "blocked", "blocked_until": state["fb_blocked_until"]}
 
-        except Exception as e:
-            print(f"⚠️ FB carousel upload skipped for one image: {e}")
+    last_ok = parse_iso(str(state.get("fb_last_posted_at", ""))) if state.get("fb_last_posted_at") else None
+    if last_ok and (now - last_ok).total_seconds() < cooldown_seconds:
+        print(f"FB: skip (cooldown {cooldown_seconds}s)")
+        return {"skipped": True, "reason": "cooldown"}
 
-    # If we couldn't upload any images, fall back
-    if not media_fbids:
-        print("⚠️ FB carousel: no media IDs collected; falling back to text post.")
-        return post_to_facebook_page(caption)
-
-    # If we only got one media ID, just do a single photo post
-    if len(media_fbids) == 1:
-        print("⚠️ FB carousel: only one media ID; falling back to single photo post.")
-        return post_photo_to_facebook_page(caption, image_urls[0])
-
-    # 2) Create the feed post attaching the unpublished media
-    data: Dict[str, Any] = {"message": caption, "access_token": page_token}
-    for i, fbid in enumerate(media_fbids):
-        data[f"attached_media[{i}]"] = json.dumps({"media_fbid": fbid})
-
-    feed_url = f"https://graph.facebook.com/v24.0/{page_id}/feed"
-    r = requests.post(
-        feed_url,
-        data=data,
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-    )
-
-    _fb_debug_response(r, "FB POST /feed (carousel)")
-
-    if r.status_code >= 400:
-        # Recommended fallback behaviour (so you still get a post out)
-        print("⚠️ FB carousel post failed; falling back to single photo, then text.")
+    def is_rate_limit(resp: requests.Response) -> bool:
         try:
-            return post_photo_to_facebook_page(caption, image_urls[0])
-        except Exception as e:
-            print(f"⚠️ FB fallback single photo failed: {e}")
-            return post_to_facebook_page(caption)
+            j = resp.json()
+            err = (j or {}).get("error", {}) or {}
+            return (resp.status_code >= 400 and err.get("code") == 368 and str(err.get("error_subcode")) == "1390008")
+        except Exception:
+            return False
 
-    return r.json()
+    def record_success():
+        state["fb_last_posted_at"] = iso(now)
+        state.pop("fb_blocked_until", None)
+        save_state(state, state_path)
+
+    def record_block():
+        until = now + dt.timedelta(seconds=block_seconds)
+        state["fb_blocked_until"] = iso(until)
+        save_state(state, state_path)
+
+    # 1) Try carousel
+    try:
+        result = post_carousel_to_facebook_page(caption, image_urls)
+        record_success()
+        return {"ok": True, "mode": "carousel", "result": result}
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        if isinstance(resp, requests.Response) and is_rate_limit(resp):
+            print("⚠️ FB rate-limited (368). Blocking FB and skipping.")
+            record_block()
+            return {"skipped": True, "reason": "rate_limited"}
+        print(f"⚠️ FB carousel failed: {e}. Trying single photo...")
+
+    # 2) Try single photo
+    try:
+        if image_urls:
+            result = post_photo_to_facebook_page(caption, image_urls[0])
+            record_success()
+            return {"ok": True, "mode": "single_photo", "result": result}
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        if isinstance(resp, requests.Response) and is_rate_limit(resp):
+            print("⚠️ FB rate-limited (368). Blocking FB and skipping.")
+            record_block()
+            return {"skipped": True, "reason": "rate_limited"}
+        print(f"⚠️ FB single photo failed: {e}. Trying text-only...")
+
+    # 3) Try text-only
+    try:
+        result = post_to_facebook_page(caption)
+        record_success()
+        return {"ok": True, "mode": "text", "result": result}
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        if isinstance(resp, requests.Response) and is_rate_limit(resp):
+            print("⚠️ FB rate-limited (368). Blocking FB and skipping.")
+            record_block()
+            return {"skipped": True, "reason": "rate_limited"}
+        print(f"⚠️ FB text-only failed too: {e}. Skipping FB.")
+        return {"skipped": True, "reason": "failed_all_modes"}
+
 
 # ----------------------------
 # Telegram approval gate (optional)
