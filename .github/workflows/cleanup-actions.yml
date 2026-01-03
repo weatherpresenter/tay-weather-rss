@@ -13,7 +13,7 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Delete old workflow runs (keep 25, all workflows)
+      - name: Delete old workflow runs (keep 25)
         uses: Mattraks/delete-workflow-runs@v2
         with:
           keep_minimum_runs: 25
