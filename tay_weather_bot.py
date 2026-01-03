@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
-# Tay Township Weather Bot (battleboard RSS -> related warnings report -> parse "What/When")
-#
-# Key behaviour:
-# - Fetch Environment Canada "battleboard" RSS (ALERT_FEED_URL)
-# - Extract the most relevant "related" link (warnings report page)
-# - Fetch that warnings report page and parse:
-#     * issued time text
-#     * alert label/type (e.g., Snow Squall)
-#     * headline sentence
-#     * What block
-#     * When line
-#     * impact/confidence (if present)
-# - Build X + Facebook post text
-#   - Headline ALWAYS ends with "in Tay Township."
-# - Print previews every run
-# - Optional posting:
-#     * X: OAuth2 for posting + OAuth1 for media upload (if enabled)
-#     * Facebook: page feed post with optional images (if enabled)
-#
-# Notes:
-# - EC HTML markup can change. This parser is designed to be resilient by using text-pattern extraction.
-# - You can force the report URL with REPORT_URL env var if needed.
+"""
+Tay Township Weather Bot
+
+Flow (updated):
+1) Fetch Environment Canada "battleboard" RSS/ATOM feed (ALERT_FEED_URL)
+2) From that feed, find the related href for the warnings report page (e.g. report_e.html?onrm94)
+3) Fetch that report page and parse:
+   - Alert title/type (e.g. "Snow Squall")
+   - Issue time text (e.g. "6:41 PM EST Friday 2 January 2026")
+   - "What:" block (sentences)
+   - "When:" block (sentences)
+4) Build social text:
+   - Headline MUST end with: "in Tay Township"
+   - Twitter includes What + When + short care line
+   - Facebook includes What + When + longer care line
+5) Optionally post to X and Facebook (controlled by env toggles).
+   - Failures SKIP posting but do NOT crash the whole run (exit 0).
+
+Requirements: requests, beautifulsoup4, requests-oauthlib, Pillow (if you later add image processing)
+"""
 
 import base64
 import datetime as dt
-import hashlib
+import email.utils
 import json
 import os
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,29 +38,26 @@ from requests_oauthlib import OAuth1
 
 
 # ----------------------------
-# Config / env
+# Config / environment
 # ----------------------------
 ALERT_FEED_URL = os.getenv("ALERT_FEED_URL", "https://weather.gc.ca/rss/battleboard/onrm94_e.xml")
-# If set, overrides RSS "related" parsing:
-REPORT_URL_OVERRIDE = os.getenv("REPORT_URL", "").strip()
-
 TAY_ALERTS_URL = os.getenv("TAY_ALERTS_URL", "https://weatherpresenter.github.io/tay-weather-rss/tay/")
-
-CR29_NORTH_IMAGE_URL = os.getenv("CR29_NORTH_IMAGE_URL", "https://511on.ca/map/Cctv/400")
-CR29_SOUTH_IMAGE_URL = os.getenv("CR29_SOUTH_IMAGE_URL", "https://511on.ca/map/Cctv/402")
+STATE_PATH = os.getenv("STATE_PATH", "state.json")
 
 ENABLE_X_POSTING = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
 ENABLE_FB_POSTING = os.getenv("ENABLE_FB_POSTING", "false").lower() == "true"
-TEST_TWEET = os.getenv("TEST_TWEET", "false").lower() == "true"
+TEST_TWEET = os.getenv("TEST_TWEET", "true").lower() == "true"
 
-STATE_PATH = os.getenv("STATE_PATH", "state.json")
+# Camera images (optional)
+CR29_NORTH_IMAGE_URL = os.getenv("CR29_NORTH_IMAGE_URL", "")
+CR29_SOUTH_IMAGE_URL = os.getenv("CR29_SOUTH_IMAGE_URL", "")
 
 # X OAuth2 (posting)
 X_CLIENT_ID = os.getenv("X_CLIENT_ID", "")
 X_CLIENT_SECRET = os.getenv("X_CLIENT_SECRET", "")
 X_REFRESH_TOKEN = os.getenv("X_REFRESH_TOKEN", "")
 
-# X OAuth1 (media upload v1.1)
+# X OAuth1 (media upload)
 X_API_KEY = os.getenv("X_API_KEY", "")
 X_API_SECRET = os.getenv("X_API_SECRET", "")
 X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN", "")
@@ -70,592 +67,570 @@ X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET", "")
 FB_PAGE_ID = os.getenv("FB_PAGE_ID", "")
 FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", "")
 
-# Cooldowns (seconds) to avoid FB spam throttles / repeat posts
-FB_MIN_SECONDS_BETWEEN_POSTS = int(os.getenv("FB_MIN_SECONDS_BETWEEN_POSTS", "900"))  # 15 min default
-X_MIN_SECONDS_BETWEEN_POSTS = int(os.getenv("X_MIN_SECONDS_BETWEEN_POSTS", "300"))   # 5 min default
+# X endpoints
+X_OAUTH2_TOKEN_URL = "https://api.x.com/2/oauth2/token"
+X_CREATE_TWEET_URL = "https://api.x.com/2/tweets"
+X_MEDIA_UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 
-# Requests defaults
-UA = "Mozilla/5.0 (compatible; TayWeatherBot/2.0; +https://github.com/weatherpresenter/tay-weather-rss)"
+# Requests
+UA = "tay-weather-bot/3.0 (+https://github.com/weatherpresenter/tay-weather-rss)"
 TIMEOUT = 25
+
+
+# ----------------------------
+# Data models
+# ----------------------------
+@dataclass
+class AlertInfo:
+    emoji: str
+    event_name: str               # e.g. "Snow Squall"
+    issue_time_text: str          # raw from page, e.g. "6:41 PM EST Friday 2 January 2026"
+    issue_short: str              # e.g. "Jan 2 6:41p"
+    what_sentences: List[str]
+    when_sentences: List[str]
+    report_url: str
 
 
 # ----------------------------
 # Helpers: state
 # ----------------------------
-def load_state() -> Dict:
-    if not os.path.exists(STATE_PATH):
-        return {
-            "seen_keys": [],
-            "last_fb_post_ts": 0,
-            "last_x_post_ts": 0,
-            "last_report_url": "",
-            "last_hash": "",
-        }
-    with open(STATE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_state(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"last_report_url": "", "last_issue_time_text": "", "last_event_name": ""}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_report_url": "", "last_issue_time_text": "", "last_event_name": ""}
 
 
-def save_state(state: Dict) -> None:
-    tmp = STATE_PATH + ".tmp"
+def save_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, STATE_PATH)
-
-
-def now_ts() -> int:
-    return int(time.time())
+    os.replace(tmp, path)
 
 
 # ----------------------------
-# Helpers: networking
+# Helpers: parsing
 # ----------------------------
-def http_get(url: str) -> requests.Response:
-    headers = {
-        "User-Agent": UA,
-        "Accept": "*/*",
+def fetch(url: str) -> str:
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.text
+
+
+def _xml_first(el: ET.Element, xpath: str, ns: dict) -> Optional[ET.Element]:
+    found = el.find(xpath, ns)
+    return found
+
+
+def _xml_all(el: ET.Element, xpath: str, ns: dict) -> List[ET.Element]:
+    return list(el.findall(xpath, ns))
+
+
+def discover_report_url_from_feed(feed_xml: str) -> str:
+    """
+    Find the warnings report URL from battleboard feed.
+    We look for <link rel="related" href="...report_e.html?..."> or any link containing report_e.html.
+    """
+    # Parse with common Atom namespace handling (feed may be Atom or RSS-ish)
+    try:
+        root = ET.fromstring(feed_xml)
+    except Exception as e:
+        raise RuntimeError(f"Could not parse feed XML: {e}")
+
+    # Namespaces
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "rss": "http://purl.org/rss/1.0/",
     }
-    r = requests.get(url, headers=headers, timeout=TIMEOUT)
-    return r
 
+    # Try Atom <feed><link ...>
+    # Some feeds are <feed xmlns="http://www.w3.org/2005/Atom">
+    # In that case tags are {atom}feed, {atom}link, etc.
+    def iter_links() -> List[Tuple[str, str]]:
+        links = []
+        # 1) Atom namespace default
+        for link in root.findall(".//{http://www.w3.org/2005/Atom}link"):
+            rel = link.attrib.get("rel", "")
+            href = link.attrib.get("href", "")
+            if href:
+                links.append((rel, href))
+        # 2) Non-namespaced link tags (just in case)
+        for link in root.findall(".//link"):
+            rel = link.attrib.get("rel", "")
+            href = link.attrib.get("href", "") or (link.text or "")
+            href = href.strip()
+            if href:
+                links.append((rel, href))
+        return links
 
-# ----------------------------
-# Step 1: parse battleboard RSS and get related report URL
-# ----------------------------
-def extract_report_url_from_battleboard(xml_bytes: bytes) -> Optional[str]:
-    """
-    Battleboard feeds vary, but commonly contain entry/item link(s).
-    We try multiple strategies:
-    - ATOM <entry><link rel="related" href="...">
-    - ATOM <entry><link href="..."> (pick warnings/report)
-    - RSS <item><link>...</link>
-    - Any URL in feed text matching weather.gc.ca/warnings/report_*.html?...=...
-    """
-    text = xml_bytes.decode("utf-8", errors="replace")
+    links = iter_links()
 
-    # Fast regex scan for warnings report URL
-    m = re.search(r"https?://weather\.gc\.ca/warnings/report_[a-z]_\.html\?[^\s\"'<]+", text, flags=re.I)
+    # Prefer rel="related"
+    for rel, href in links:
+        if rel.lower() == "related" and "report_e.html" in href:
+            return href
+
+    # Any report link
+    for rel, href in links:
+        if "report_e.html" in href:
+            return href
+
+    # As fallback: maybe "warnings/report_e.html?XXXX" appears in text
+    m = re.search(r"https?://weather\.gc\.ca/warnings/report_e\.html\?[a-z0-9]+", feed_xml, re.I)
     if m:
         return m.group(0)
 
-    # XML parse
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
-        return None
-
-    # Helper to iterate elements without caring about namespaces
-    def strip_ns(tag: str) -> str:
-        return tag.split("}", 1)[-1] if "}" in tag else tag
-
-    # Collect candidate hrefs
-    candidates: List[str] = []
-
-    for elem in root.iter():
-        if strip_ns(elem.tag) == "link":
-            href = elem.attrib.get("href", "") or (elem.text or "")
-            rel = (elem.attrib.get("rel", "") or "").lower()
-            if href:
-                candidates.append(href.strip())
-            # Sometimes <link rel="related" href="...">
-            if rel == "related" and href:
-                candidates.insert(0, href.strip())
-
-    # RSS style <item><link>...</link>
-    for elem in root.iter():
-        if strip_ns(elem.tag) == "link" and (elem.text or "").strip():
-            candidates.append(elem.text.strip())
-
-    # Prefer warnings report links for the location
-    for c in candidates:
-        if "weather.gc.ca/warnings/report_" in c and "onrm94" in c:
-            return c
-    for c in candidates:
-        if "weather.gc.ca/warnings/report_" in c:
-            return c
-
-    return candidates[0] if candidates else None
+    raise RuntimeError("Could not discover warnings report URL from feed.")
 
 
-# ----------------------------
-# Step 2: parse the warnings report page for fields
-# ----------------------------
-def clean_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def parse_report_fields(report_html: str) -> Dict[str, str]:
+def normalize_event_name(raw: str) -> str:
     """
-    Returns:
-      issued_text
-      impact_level
-      forecast_confidence
-      alert_label (e.g., "Snow Squall" or fallback "Weather information")
-      headline_sentence (first sentence before "What:" if present)
-      what_block
-      when_line
+    raw examples from the report page:
+      "Yellow Warning - Snow Squall"
+      "Red Warning - Tornado"
+    We want: "Snow Squall"
     """
-    soup = BeautifulSoup(report_html, "html.parser")
-    page_text = clean_spaces(soup.get_text(" ", strip=True))
-
-    # Issued time: look for e.g. "6:41 PM EST Friday 2 January 2026"
-    issued_text = ""
-    m = re.search(r"\b\d{1,2}:\d{2}\s*(AM|PM)\s*[A-Z]{2,4}\s+\w+\s+\d{1,2}\s+\w+\s+\d{4}\b", page_text)
-    if m:
-        issued_text = m.group(0)
-
-    # Impact level & forecast confidence often appear as "Impact Level: Moderate" etc.
-    impact_level = ""
-    m = re.search(r"Impact Level:\s*([A-Za-z]+)", page_text)
-    if m:
-        impact_level = m.group(1)
-
-    forecast_confidence = ""
-    m = re.search(r"Forecast Confidence:\s*([A-Za-z]+)", page_text)
-    if m:
-        forecast_confidence = m.group(1)
-
-    # Alert label:
-    # Try to find a phrase like "Yellow Warning - Snow Squall" or "Snow Squall Warning"
-    alert_label = "Weather information"
-    # Prefer "Snow Squall" etc.
-    m = re.search(r"(Snow Squall|Winter Storm|Snowfall|Freezing Rain|Blizzard|Tornado|Thunderstorm|Rainfall|Heat|Cold)\b", page_text, flags=re.I)
-    if m:
-        alert_label = m.group(1).title()
-
-    # The main alert paragraph often contains:
-    # "<headline>. What: ... When: ... Where: ..."
-    headline_sentence = ""
-    what_block = ""
-    when_line = ""
-
-    # Extract What and When using robust patterns
-    # 1) What: ... When:
-    m = re.search(r"\bWhat:\s*(.*?)\s*\bWhen:\s*(.*?)(\s*\bWhere:\b|\s*\bAdditional information:\b|$)", page_text, flags=re.I)
-    if m:
-        what_block = clean_spaces(m.group(1))
-        when_line = clean_spaces(m.group(2))
-
-        # Headline is the text immediately before "What:" if possible.
-        pre = page_text[: m.start()]
-        # Take last ~200 chars before What: and grab last sentence.
-        tail = pre[-300:]
-        # Find last sentence-like chunk
-        sent = re.split(r"(?<=[.!?])\s+", tail)
-        headline_sentence = clean_spaces(sent[-1]) if sent else ""
-        # Sometimes it still includes separators; clean known junk.
-        headline_sentence = re.sub(r"^\*+\s*", "", headline_sentence).strip()
-
-    # Fallback: if no What/When found, use first sentence after the timestamp line if present
-    if not headline_sentence:
-        # Try to find a sentence that follows the issued time.
-        if issued_text:
-            idx = page_text.find(issued_text)
-            if idx != -1:
-                after = page_text[idx + len(issued_text):]
-                sent = re.split(r"(?<=[.!?])\s+", after.strip())
-                if sent and sent[0]:
-                    headline_sentence = clean_spaces(sent[0])
-
-    return {
-        "issued_text": issued_text,
-        "impact_level": impact_level,
-        "forecast_confidence": forecast_confidence,
-        "alert_label": alert_label,
-        "headline_sentence": headline_sentence,
-        "what_block": what_block,
-        "when_line": when_line,
-    }
+    raw = raw.strip()
+    raw = re.sub(r"^(Yellow|Red|Orange)\s+Warning\s*-\s*", "", raw, flags=re.I).strip()
+    # Some pages might include extra words; keep it tidy
+    return raw
 
 
-# ----------------------------
-# Post text builders
-# ----------------------------
-def severity_emoji_from_label(label: str) -> str:
-    # Keep your existing "yellow warning" vibe; if you later parse colour explicitly, adjust here.
+def emoji_from_colour_word(colour_word: str) -> str:
+    cw = colour_word.strip().lower()
+    if cw == "red":
+        return "🔴"
+    if cw == "orange":
+        return "🟠"
+    # report page currently says "Yellow Warnings"
     return "🟡"
 
 
-def build_headline(alert_label: str) -> str:
-    # REQUIRED: headline ends with "in Tay Township."
-    # Keep it short + consistent.
-    return f"{alert_label} in Tay Township."
+def parse_issue_short(issue_time_text: str) -> str:
+    """
+    Input like: "6:41 PM EST Friday 2 January 2026"
+    Output like: "Jan 2 6:41p"
+    """
+    s = issue_time_text.strip()
 
-
-def split_sentences(text: str) -> List[str]:
-    text = clean_spaces(text)
-    if not text:
-        return []
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    # Remove trailing punctuation duplicates
-    return [p.strip() for p in parts if p.strip()]
-
-
-def build_x_text(fields: Dict[str, str]) -> str:
-    emoji = severity_emoji_from_label(fields["alert_label"])
-    headline = build_headline(fields["alert_label"])
-
-    # What/When (keep X short)
-    what_sents = split_sentences(fields.get("what_block", ""))
-    when_line = fields.get("when_line", "").strip()
-
-    # Simple care line (your style)
-    care = "Please take care, travel only if needed and check on neighbours who may need support."
-
-    issued_short = ""
-    if fields.get("issued_text"):
-        # Turn "6:41 PM EST Friday 2 January 2026" -> "Jan 2 6:41p"
-        issued_short = format_issued_short(fields["issued_text"])
-
-    chunks: List[str] = [f"{emoji} - {headline}"]
-
-    # Add 1-2 What sentences if available
-    if what_sents:
-        chunks.append(f"What: {what_sents[0]}")
-        if len(what_sents) > 1:
-            chunks.append(what_sents[1])
-
-    # Add When if room
-    if when_line:
-        chunks.append(f"When: {when_line}")
-
-    chunks.append(care)
-    chunks.append(f"More: {TAY_ALERTS_URL}")
-    if issued_short:
-        chunks.append(f"Issued {issued_short}")
-    chunks.append("#TayTownship #ONStorm")
-
-    text = " | ".join([c for c in chunks if c])
-
-    # Hard trim to 280
-    if len(text) <= 280:
-        return text
-
-    # If too long, progressively drop less critical parts
-    order_to_drop = [
-        ("when", f"When: {when_line}" if when_line else ""),
-        ("what2", what_sents[1] if len(what_sents) > 1 else ""),
-        ("what1", f"What: {what_sents[0]}" if what_sents else ""),
-        ("care", care),
-    ]
-
-    cur_chunks = [c for c in chunks if c]
-    for _, drop in order_to_drop:
-        if drop and any(drop == c for c in cur_chunks):
-            cur_chunks = [c for c in cur_chunks if c != drop]
-            text = " | ".join(cur_chunks)
-            if len(text) <= 280:
-                return text
-
-    # Final trim: brutal cut but keep hashtags
-    # Ensure hashtags remain at end
-    hashtags = "#TayTownship #ONStorm"
-    base = text.replace(hashtags, "").strip(" |")
-    max_base = 280 - (len(hashtags) + 3)
-    if max_base < 0:
-        return hashtags[:280]
-    base = base[:max_base].rstrip(" |")
-    return f"{base} | {hashtags}"
-
-
-def build_fb_text(fields: Dict[str, str]) -> str:
-    emoji = severity_emoji_from_label(fields["alert_label"])
-    headline = build_headline(fields["alert_label"])
-
-    what_sents = split_sentences(fields.get("what_block", ""))
-    when_line = fields.get("when_line", "").strip()
-
-    # Longer care statement for Facebook
-    care = (
-        "If you can, please stay off the roads and give crews room to work. "
-        "If you must go out, slow down, leave extra space and keep your lights on. "
-        "Please check on neighbours who may need help staying warm or getting supplies."
+    # Very forgiving parse:
+    # Capture: time hh:mm, AM/PM, day number, month name, year
+    m = re.search(
+        r"(\d{1,2}:\d{2})\s*([AP]M)\s+\w+\s+\w+\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+        s,
+        re.I,
     )
-
-    issued_short = ""
-    if fields.get("issued_text"):
-        issued_short = format_issued_short(fields["issued_text"])
-
-    chunks: List[str] = [f"{emoji} - {headline}"]
-
-    # Add up to 3 What sentences
-    if what_sents:
-        chunks.append("What: " + " ".join(what_sents[:3]))
-
-    if when_line:
-        chunks.append(f"When: {when_line}")
-
-    chunks.append(care)
-    chunks.append(f"More: {TAY_ALERTS_URL}")
-    if issued_short:
-        chunks.append(f"Issued {issued_short}")
-    chunks.append("#TayTownship #ONStorm")
-
-    return " | ".join([c for c in chunks if c])
-
-
-def format_issued_short(issued_text: str) -> str:
-    """
-    Example input: "6:41 PM EST Friday 2 January 2026"
-    Output: "Jan 2 6:41p"
-    """
-    s = issued_text.strip()
-    # Capture time + day + month name
-    m = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)\s*[A-Z]{2,4}\s+\w+\s+(\d{1,2})\s+(\w+)\s+\d{4}", s)
     if not m:
+        # fallback: keep something usable
         return s
+
     hhmm = m.group(1)
     ampm = m.group(2).lower()
     day = int(m.group(3))
-    mon_name = m.group(4)
-    mon = mon_name[:3].title()
-    return f"{mon} {day} {hhmm}{'a' if ampm=='am' else 'p'}"
+    month_name = m.group(4)
+    year = int(m.group(5))
+
+    # Month short (Jan, Feb, ...)
+    try:
+        month_dt = dt.datetime.strptime(month_name[:3], "%b")
+        mon_short = month_dt.strftime("%b")
+    except Exception:
+        mon_short = month_name[:3].title()
+
+    # Convert "6:41" + "pm" to "6:41p"
+    ampm_short = "a" if ampm.startswith("a") else "p"
+    return f"{mon_short} {day} {hhmm}{ampm_short}"
 
 
-# ----------------------------
-# X posting (OAuth2 tweet, OAuth1 media upload)
-# ----------------------------
-def get_oauth2_access_token() -> Tuple[Optional[str], Optional[str]]:
+def split_sentences(block: str) -> List[str]:
     """
-    Uses refresh_token to obtain a bearer access token.
-    Returns (access_token, rotated_refresh_token_or_None)
+    Turn a 'What:' or 'When:' block into clean sentences.
+    Keep short-ish, trimmed, with trailing periods preserved.
+    """
+    b = re.sub(r"\s+", " ", block).strip()
+
+    # Split on ". " but keep period
+    parts = re.split(r"(?<=[.!?])\s+", b)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # Ensure it ends with punctuation if it looks like a sentence fragment
+        if not re.search(r"[.!?]$", p):
+            p += "."
+        out.append(p)
+    return out
+
+
+def parse_report_page(report_html: str, report_url: str) -> AlertInfo:
+    """
+    Extract:
+      - colour + event name
+      - issue time
+      - What / When blocks
+    The content on the report page is often rendered as plain text; we rely on regex over cleaned text.
+    Example snippet (from the page):
+      "yellow icon Yellow Warning - Snow Squall
+       6:41 PM EST Friday 2 January 2026
+       ...
+       Snow squalls continue tonight. What: Additional... When: Continuing tonight. ..."
+    """
+    soup = BeautifulSoup(report_html, "html.parser")
+    text = soup.get_text("\n")
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Find colour + raw title line: "Yellow Warning - Snow Squall"
+    m_title = re.search(r"\b(Yellow|Red|Orange)\s+Warning\s*-\s*([^\n\r]+)", text, re.I)
+    if not m_title:
+        # fallback: maybe "Yellow Warnings" section then a title line
+        m_title = re.search(r"\b(Yellow|Red|Orange)\s+Warnings\b.*?\b(Yellow|Red|Orange)\s+Warning\s*-\s*([^\n\r]+)", text, re.I | re.S)
+        if not m_title:
+            raise RuntimeError("Could not find alert title (e.g., 'Yellow Warning - ...') on report page.")
+
+    colour_word = m_title.group(1)
+    raw_title = f"{colour_word.title()} Warning - {m_title.group(2).strip()}"
+    event_name = normalize_event_name(raw_title)
+    emoji = emoji_from_colour_word(colour_word)
+
+    # Find issue time line like: "6:41 PM EST Friday 2 January 2026"
+    m_issue = re.search(r"\b(\d{1,2}:\d{2}\s*[AP]M\s+\w+\s+\w+\s+\d{1,2}\s+[A-Za-z]+\s+\d{4})\b", text, re.I)
+    if not m_issue:
+        raise RuntimeError("Could not find issue time text on report page.")
+    issue_time_text = m_issue.group(1).strip()
+    issue_short = parse_issue_short(issue_time_text)
+
+    # Find What / When blocks
+    # We capture:
+    #   What: ... When: ... Where:
+    # or if Where isn't present, stop at "Additional information:" or "In effect for:"
+    m_blocks = re.search(
+        r"\bWhat:\s*(.+?)\s*\bWhen:\s*(.+?)(?:\s*\bWhere:\s*|\s*\bAdditional information:\s*|\s*\bIn effect for:\s*)",
+        text,
+        re.I | re.S,
+    )
+    if not m_blocks:
+        # fallback: try stopping at "For road conditions"
+        m_blocks = re.search(
+            r"\bWhat:\s*(.+?)\s*\bWhen:\s*(.+?)(?:\s*For road conditions|\s*Please continue to monitor|\s*\bIn effect for:\s*)",
+            text,
+            re.I | re.S,
+        )
+    if not m_blocks:
+        raise RuntimeError("Could not extract What/When blocks from report page.")
+
+    what_block = m_blocks.group(1).strip()
+    when_block = m_blocks.group(2).strip()
+
+    what_sentences = split_sentences(what_block)
+    when_sentences = split_sentences(when_block)
+
+    return AlertInfo(
+        emoji=emoji,
+        event_name=event_name,
+        issue_time_text=issue_time_text,
+        issue_short=issue_short,
+        what_sentences=what_sentences,
+        when_sentences=when_sentences,
+        report_url=report_url,
+    )
+
+
+# ----------------------------
+# Post building
+# ----------------------------
+CARE_TWITTER = "Please take care, travel only if needed and check on neighbours who may need support."
+CARE_FACEBOOK = "If you can, please stay off the roads and give crews room to work. If you must go out, slow down, leave extra space and keep your lights on. Please check on neighbours who may need help staying warm or getting supplies."
+HASHTAGS = "#TayTownship #ONStorm"
+
+
+def build_headline(alert: AlertInfo) -> str:
+    # Must end with "in Tay Township"
+    return f"{alert.emoji} - {alert.event_name} in Tay Township"
+
+
+def build_twitter_text(alert: AlertInfo) -> str:
+    headline = build_headline(alert)
+
+    # Prefer exactly the look you showed:
+    # headline blank line then lines then blank line then More + Issued + hashtags
+    lines = [headline, ""]
+    for s in alert.what_sentences[:2]:
+        lines.append(s)
+    for s in alert.when_sentences[:2]:
+        lines.append(s)
+
+    lines.append(CARE_TWITTER)
+    lines.append("")
+    lines.append(f"More: {TAY_ALERTS_URL}")
+    lines.append(f"Issued {alert.issue_short} {HASHTAGS}")
+
+    text = "\n".join(lines).strip()
+
+    # Enforce 280 chars: drop extra What/When sentences first, then shorten care.
+    if len(text) <= 280:
+        return text
+
+    # Rebuild progressively smaller
+    def assemble(what_n: int, when_n: int, care: str) -> str:
+        ll = [headline, ""]
+        for s2 in alert.what_sentences[:what_n]:
+            ll.append(s2)
+        for s2 in alert.when_sentences[:when_n]:
+            ll.append(s2)
+        ll.append(care)
+        ll.append("")
+        ll.append(f"More: {TAY_ALERTS_URL}")
+        ll.append(f"Issued {alert.issue_short} {HASHTAGS}")
+        return "\n".join(ll).strip()
+
+    # Try fewer lines
+    candidates = [
+        assemble(2, 1, CARE_TWITTER),
+        assemble(1, 1, CARE_TWITTER),
+        assemble(1, 1, "Please take care and travel only if needed."),
+        assemble(1, 0, "Please take care and travel only if needed."),
+        assemble(0, 0, "Please take care and travel only if needed."),
+    ]
+    for c in candidates:
+        if len(c) <= 280:
+            return c
+
+    # Last resort hard trim (still keep headline + More + Issued)
+    trimmed = assemble(0, 0, "Please take care.").strip()
+    if len(trimmed) > 280:
+        trimmed = trimmed[:277] + "…"
+    return trimmed
+
+
+def build_facebook_text(alert: AlertInfo) -> str:
+    headline = build_headline(alert)
+    lines = [headline, ""]
+    for s in alert.what_sentences[:3]:
+        lines.append(s)
+    for s in alert.when_sentences[:2]:
+        lines.append(s)
+    lines.append(CARE_FACEBOOK)
+    lines.append("")
+    lines.append(f"More: {TAY_ALERTS_URL}")
+    lines.append(f"Issued {alert.issue_short} {HASHTAGS}")
+    return "\n".join(lines).strip()
+
+
+# ----------------------------
+# X posting (OAuth2 create tweet + OAuth1 media upload)
+# ----------------------------
+def get_oauth2_access_token() -> Optional[str]:
+    """
+    Refresh OAuth2 access token using refresh_token.
+    Writes rotated refresh token to x_refresh_token_rotated.txt if present.
     """
     if not (X_CLIENT_ID and X_CLIENT_SECRET and X_REFRESH_TOKEN):
-        return None, None
+        print("⚠️ X skipped: missing OAuth2 env (X_CLIENT_ID/X_CLIENT_SECRET/X_REFRESH_TOKEN)")
+        return None
 
-    url = "https://api.x.com/2/oauth2/token"
-    auth = (X_CLIENT_ID, X_CLIENT_SECRET)
-
+    basic = base64.b64encode(f"{X_CLIENT_ID}:{X_CLIENT_SECRET}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": UA,
+    }
     data = {
         "grant_type": "refresh_token",
         "refresh_token": X_REFRESH_TOKEN,
     }
 
-    headers = {"User-Agent": UA}
-
-    r = requests.post(url, auth=auth, data=data, headers=headers, timeout=TIMEOUT)
-    # Print helpful debug on failure
-    if r.status_code >= 400:
+    r = requests.post(X_OAUTH2_TOKEN_URL, headers=headers, data=data, timeout=TIMEOUT)
+    print(f"X token refresh status: {r.status_code}")
+    if r.status_code != 200:
         try:
-            print(f"X token refresh status: {r.status_code}")
             print(f"X token refresh error body: {r.text}")
         except Exception:
             pass
-        r.raise_for_status()
+        return None
 
     payload = r.json()
     access_token = payload.get("access_token")
     new_refresh = payload.get("refresh_token")
-    rotated = None
     if new_refresh and new_refresh != X_REFRESH_TOKEN:
-        rotated = new_refresh
-    print(f"X token refresh status: {r.status_code}")
-    return access_token, rotated
+        # let the workflow update the repo secret
+        with open("x_refresh_token_rotated.txt", "w", encoding="utf-8") as f:
+            f.write(new_refresh)
+        print("⚠️ X refresh token rotated. Workflow will update the repo secret.")
+
+    return access_token
 
 
-def upload_media_to_x(image_url: str) -> Optional[str]:
+def x_upload_media_from_url(image_url: str) -> Optional[str]:
     """
-    Upload an image to X using v1.1 media endpoint (requires OAuth1 user context).
-    Returns media_id_string.
+    Uploads media to X using OAuth1. Returns media_id_string.
     """
+    if not image_url:
+        return None
+
     if not (X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET):
+        print("⚠️ X media upload skipped: missing OAuth1 env (X_API_KEY/.../X_ACCESS_TOKEN_SECRET)")
         return None
 
-    # Download image bytes
-    r = http_get(image_url)
-    r.raise_for_status()
-    b64 = base64.b64encode(r.content).decode("ascii")
-
-    oauth = OAuth1(
-        X_API_KEY,
-        client_secret=X_API_SECRET,
-        resource_owner_key=X_ACCESS_TOKEN,
-        resource_owner_secret=X_ACCESS_TOKEN_SECRET,
-    )
-
-    upload_url = "https://upload.twitter.com/1.1/media/upload.json"
-    resp = requests.post(upload_url, auth=oauth, data={"media_data": b64}, timeout=TIMEOUT)
-    print(f"X media upload status: {resp.status_code}")
-    if resp.status_code >= 400:
-        print(resp.text)
+    try:
+        img = requests.get(image_url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+        img.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ X media fetch failed ({image_url}): {e}")
         return None
-    j = resp.json()
+
+    oauth = OAuth1(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
+    files = {"media": img.content}
+
+    r = requests.post(X_MEDIA_UPLOAD_URL, auth=oauth, files=files, timeout=TIMEOUT)
+    print(f"X media upload status: {r.status_code}")
+    if r.status_code != 200:
+        print(f"X media upload error: {r.text}")
+        return None
+
+    j = r.json()
     return j.get("media_id_string")
 
 
-def post_to_x(text: str, image_urls: Optional[List[str]] = None) -> None:
-    access_token, rotated = get_oauth2_access_token()
+def post_to_x(text: str, image_urls: List[str]) -> bool:
+    access_token = get_oauth2_access_token()
     if not access_token:
-        raise RuntimeError("X_TOKEN_REFRESH_FAILED")
+        print("⚠️ X skipped: X_TOKEN_REFRESH_FAILED")
+        return False
 
-    if rotated:
-        print("⚠️ X refresh token rotated. Workflow will update the repo secret.")
-        with open("x_refresh_token_rotated.txt", "w", encoding="utf-8") as f:
-            f.write(rotated)
+    media_ids = []
+    for u in image_urls:
+        mid = x_upload_media_from_url(u)
+        if mid:
+            media_ids.append(mid)
 
-    media_ids: List[str] = []
-    if image_urls:
-        for u in image_urls[:4]:
-            mid = upload_media_to_x(u)
-            if mid:
-                media_ids.append(mid)
-
-    url = "https://api.x.com/2/tweets"
-    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": UA, "Content-Type": "application/json"}
     payload = {"text": text}
     if media_ids:
-        payload["media"] = {"media_ids": media_ids}
+        payload["media"] = {"media_ids": media_ids[:4]}
 
-    if TEST_TWEET:
-        print("⚠️ TEST_TWEET enabled: skipping X post.")
-        return
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+    }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
+    r = requests.post(X_CREATE_TWEET_URL, headers=headers, json=payload, timeout=TIMEOUT)
     print(f"X POST /2/tweets status: {r.status_code}")
-    if r.status_code >= 400:
-        raise RuntimeError(f"X post failed {r.status_code} {r.text}")
+    if r.status_code not in (200, 201):
+        print(f"⚠️ X post error: {r.text}")
+        return False
+
+    return True
 
 
 # ----------------------------
 # Facebook posting
 # ----------------------------
-def fb_post_message_with_images(message: str, image_urls: List[str]) -> None:
-    """
-    Simplest approach: post message to /feed.
-    If you want true multi-image carousel, you need unpublished photo uploads + attached_media.
-    This function does an "unpublished photo" upload flow and attaches them.
-    """
+def fb_post_text(message: str) -> bool:
     if not (FB_PAGE_ID and FB_PAGE_ACCESS_TOKEN):
-        raise RuntimeError("FB_MISSING_CREDS")
+        print("⚠️ Facebook skipped: missing FB_PAGE_ID/FB_PAGE_ACCESS_TOKEN")
+        return False
 
-    # Upload photos unpublished
-    media_fbid: List[str] = []
-    for u in image_urls[:4]:
-        # Download bytes
-        r = http_get(u)
-        r.raise_for_status()
-
-        photo_url = f"https://graph.facebook.com/v24.0/{FB_PAGE_ID}/photos"
-        files = {"source": ("image.jpg", r.content, "image/jpeg")}
-        data = {"published": "false", "access_token": FB_PAGE_ACCESS_TOKEN}
-        resp = requests.post(photo_url, files=files, data=data, timeout=TIMEOUT)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Facebook photo upload failed {resp.status_code} {resp.text}")
-        j = resp.json()
-        if "id" in j:
-            media_fbid.append(j["id"])
-
-    # Post feed with attached_media
-    feed_url = f"https://graph.facebook.com/v24.0/{FB_PAGE_ID}/feed"
+    url = f"https://graph.facebook.com/v24.0/{FB_PAGE_ID}/feed"
     data = {"message": message, "access_token": FB_PAGE_ACCESS_TOKEN}
-    for idx, mid in enumerate(media_fbid):
-        data[f"attached_media[{idx}]"] = json.dumps({"media_fbid": mid})
 
-    r = requests.post(feed_url, data=data, timeout=TIMEOUT)
-    print(f"FB POST /feed (carousel) status: {r.status_code}")
-    if r.status_code >= 400:
-        raise RuntimeError(f"Facebook carousel post failed {r.status_code} {r.text}")
+    r = requests.post(url, data=data, timeout=TIMEOUT)
+    print(f"FB POST /feed status: {r.status_code}")
+    if r.status_code not in (200, 201):
+        print(f"⚠️ Facebook post error: {r.text}")
+        return False
+    return True
 
 
 # ----------------------------
-# Main workflow
+# Main
 # ----------------------------
-def main() -> None:
-    state = load_state()
+def main() -> int:
+    state = load_state(STATE_PATH)
 
-    # 1) Determine report URL
-    report_url = REPORT_URL_OVERRIDE
-    if not report_url:
-        rss = http_get(ALERT_FEED_URL)
-        rss.raise_for_status()
-        report_url = extract_report_url_from_battleboard(rss.content) or ""
+    # 1) Fetch feed
+    try:
+        feed_xml = fetch(ALERT_FEED_URL)
+    except Exception as e:
+        print(f"❌ Failed to fetch battleboard feed: {e}")
+        return 0  # don't hard-fail workflow
 
-    if not report_url:
-        raise RuntimeError("Could not determine report URL from battleboard RSS. Set REPORT_URL env var to override.")
+    # 2) Discover report URL from feed
+    try:
+        report_url = discover_report_url_from_feed(feed_xml)
+    except Exception as e:
+        print(f"❌ Failed to find report URL from feed: {e}")
+        return 0
 
-    # 2) Fetch report page + parse fields
-    rep = http_get(report_url)
-    rep.raise_for_status()
-    fields = parse_report_fields(rep.text)
+    # 3) Fetch report page
+    try:
+        report_html = fetch(report_url)
+    except Exception as e:
+        print(f"❌ Failed to fetch report page: {e}")
+        return 0
 
-    # 3) Build texts (always show previews)
-    x_text = build_x_text(fields)
-    fb_text = build_fb_text(fields)
+    # 4) Parse report page
+    try:
+        alert = parse_report_page(report_html, report_url)
+    except Exception as e:
+        print(f"❌ Failed to parse report page: {e}")
+        return 0
 
-    print(f"X preview: {x_text}")
-    print(f"FB preview: {fb_text}")
+    # De-dupe: if it's exactly the same as last run (same report URL + same issue time + same event)
+    if (
+        state.get("last_report_url") == alert.report_url
+        and state.get("last_issue_time_text") == alert.issue_time_text
+        and state.get("last_event_name") == alert.event_name
+    ):
+        print("No new alert content (same report + issue time + event). Nothing to do.")
+        return 0
 
-    # 4) Create a stable "alert key" to avoid reposting the same content
-    key_material = json.dumps(
-        {
-            "report_url": report_url,
-            "issued_text": fields.get("issued_text", ""),
-            "what": fields.get("what_block", ""),
-            "when": fields.get("when_line", ""),
-            "label": fields.get("alert_label", ""),
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-    )
-    content_hash = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:24]
+    # 5) Build messages
+    x_text = build_twitter_text(alert)
+    fb_text = build_facebook_text(alert)
 
-    # If we've already posted this hash, stop
-    seen = set(state.get("seen_keys", []))
-    if content_hash in seen:
-        print("No new alert content (hash already seen).")
-        state["last_report_url"] = report_url
-        state["last_hash"] = content_hash
-        save_state(state)
-        return
+    print("X preview:")
+    print(x_text)
+    print("\nFB preview:")
+    print(fb_text)
 
-    # 5) Posting cooldown checks
-    camera_image_urls = [CR29_NORTH_IMAGE_URL, CR29_SOUTH_IMAGE_URL]
+    # 6) Post (optional)
+    image_urls = [u for u in [CR29_NORTH_IMAGE_URL, CR29_SOUTH_IMAGE_URL] if u]
 
-    posted_any = False
-    skipped_reasons: List[str] = []
-
-    # X
-    if ENABLE_X_POSTING:
-        if now_ts() - int(state.get("last_x_post_ts", 0)) < X_MIN_SECONDS_BETWEEN_POSTS:
-            skipped_reasons.append("X cooldown")
-        else:
-            try:
-                post_to_x(x_text, image_urls=camera_image_urls)
-                state["last_x_post_ts"] = now_ts()
-                posted_any = True
-            except Exception as e:
-                skipped_reasons.append(f"X failed: {e}")
-                print(f"⚠️ X skipped: {e}")
+    social_posted = 0
+    if ENABLE_X_POSTING and not TEST_TWEET:
+        ok = post_to_x(x_text, image_urls=image_urls)
+        social_posted += 1 if ok else 0
+    elif ENABLE_X_POSTING and TEST_TWEET:
+        print("🧪 TEST_TWEET=true: X posting disabled (preview only).")
     else:
-        skipped_reasons.append("X disabled")
+        print("X posting disabled.")
 
-    # Facebook
-    if ENABLE_FB_POSTING:
-        if now_ts() - int(state.get("last_fb_post_ts", 0)) < FB_MIN_SECONDS_BETWEEN_POSTS:
-            skipped_reasons.append("FB cooldown")
-        else:
-            try:
-                fb_post_message_with_images(fb_text, camera_image_urls)
-                state["last_fb_post_ts"] = now_ts()
-                posted_any = True
-            except Exception as e:
-                skipped_reasons.append(f"FB failed: {e}")
-                print(f"⚠️ Facebook skipped: {e}")
+    if ENABLE_FB_POSTING and not TEST_TWEET:
+        ok = fb_post_text(fb_text)
+        social_posted += 1 if ok else 0
+    elif ENABLE_FB_POSTING and TEST_TWEET:
+        print("🧪 TEST_TWEET=true: Facebook posting disabled (preview only).")
     else:
-        skipped_reasons.append("FB disabled")
+        print("Facebook posting disabled.")
 
-    # 6) Update state
-    seen.add(content_hash)
-    # keep last 200
-    state["seen_keys"] = list(seen)[-200:]
-    state["last_report_url"] = report_url
-    state["last_hash"] = content_hash
-    save_state(state)
+    # 7) Update state even if social posting failed — this prevents infinite spam retries.
+    state["last_report_url"] = alert.report_url
+    state["last_issue_time_text"] = alert.issue_time_text
+    state["last_event_name"] = alert.event_name
+    state["last_run_utc"] = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    save_state(STATE_PATH, state)
 
-    if not posted_any:
-        print("No social posts sent for this alert.")
-        if skipped_reasons:
-            print("Reasons:", " | ".join(skipped_reasons))
+    if social_posted == 0:
+        print("No social posts sent (skipped/failed), but state updated.")
+    else:
+        print(f"Social posts sent: {social_posted}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
