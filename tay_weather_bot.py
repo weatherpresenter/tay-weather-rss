@@ -468,84 +468,90 @@ def fetch_ec_page_details(url: str) -> Dict[str, Any]:
 # Social text builders
 # ----------------------------
 def build_x_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
-    header = f"{emoji} {event_name} in Tay Township".strip()
-
+    """
+    X (Twitter):
+    - Line 1 MUST end with: "in Tay Township."
+    - Include headline + What + When + care + More + Issued + hashtags if possible
+    - Hard limit 280 chars (including spaces)
+    - No "What:" / "When:" labels
+    - No blank lines (saves characters)
+    """
     headline = (details.get("headline") or "").strip()
-    what_lines = details.get("what_lines") or []
+    what_lines = [w.strip() for w in (details.get("what_lines") or []) if (w or "").strip()]
     when_line = (details.get("when_line") or "").strip()
     issued_short = (details.get("issued_short") or "").strip()
 
-    # Warm, short, no Oxford commas
     care = "Please take care, travel only if needed and check on neighbours who may need support."
 
-    base_lines: List[str] = [header]
+    # Line 1: emoji - headline in Tay Township.
     if headline:
-        base_lines.append(headline)
+        h = headline[:-1] if headline.endswith(".") else headline
+        line1 = f"{emoji} - {h} in Tay Township."
+    else:
+        line1 = f"{emoji} - {event_name} in Tay Township."
 
-    chosen_what = [w for w in what_lines if w][:X_WHAT_MAX]
+    # We want: line1 + up to 2 what lines + when + care + More + Issued + hashtags
+    chosen_what = what_lines[:X_WHAT_MAX]
 
-    def compose(include_when: bool, include_care: bool, what_count: int) -> str:
-        lines = list(base_lines)
+    def compose(
+        include_what_count: int,
+        include_when: bool,
+        include_care: bool,
+        include_issued: bool,
+        include_tags: bool,
+    ) -> str:
+        lines: List[str] = [line1]
 
-        if what_count > 0:
-            lines.append("")
-            lines.extend(chosen_what[:what_count])
+        if include_what_count > 0:
+            lines.extend(chosen_what[:include_what_count])
 
         if include_when and when_line:
-            lines.append("")
-            lines.append(f"When: {when_line}".replace("When: When:", "When:").strip())
+            lines.append(when_line)
 
         if include_care:
-            lines.append("")
             lines.append(care)
 
         lines.append(f"More: {MORE_INFO_URL}")
-        if issued_short:
+
+        if include_issued and issued_short:
             lines.append(issued_short)
-        lines.append(HASHTAGS)
 
-        cleaned: List[str] = []
-        for ln in lines:
-            ln = (ln or "").rstrip()
-            if ln == "" and (not cleaned or cleaned[-1] == ""):
-                continue
-            cleaned.append(ln)
-        return "\n".join(cleaned).strip()
+        if include_tags and HASHTAGS:
+            lines.append(HASHTAGS)
 
+        # No blank lines between blocks
+        return "\n".join([ln for ln in lines if ln]).strip()
+
+    # Try richest → leanest (drop only what we must)
     candidates = [
-        compose(include_when=True, include_care=True, what_count=2),
-        compose(include_when=False, include_care=True, what_count=2),
-        compose(include_when=False, include_care=True, what_count=1),
-        compose(include_when=False, include_care=False, what_count=2),
-        compose(include_when=False, include_care=False, what_count=1),
+        compose(2, True, True, True, True),
+        compose(2, True, True, False, True),   # drop issued
+        compose(2, True, False, False, True),  # drop care
+        compose(2, False, False, False, True), # drop when
+        compose(1, True, False, False, True),  # drop 2nd what
+        compose(1, False, False, False, True), # drop when too
+        compose(0, False, False, False, True), # headline + link + tags only
+        compose(0, False, False, False, False) # absolute minimum
     ]
 
     for t in candidates:
         if len(t) <= 280:
             return t
 
-    # Hard truncate last resort (keep hashtags)
-    t = candidates[-1]
-    if len(t) <= 280:
-        return t
-
-    lines = t.splitlines()
-    if not lines:
-        return t[:280]
-    tail = lines[-1]
-    head = "\n".join(lines[:-1]).rstrip()
-    room = 280 - (len(tail) + 1)
-    if room < 0:
-        return tail[:280]
-    head = head[:room].rstrip()
-    return (head + "\n" + tail).strip()
+    # Ultra-last resort: just line1
+    return line1[:280]
 
 
 def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
-    header = f"{emoji} {event_name} in Tay Township".strip()
-
+    """
+    Facebook:
+    - Line 1 must end with "in Tay Township."
+    - Include headline + up to 3 What lines + When line + care + More + Issued + hashtags
+    - No "What:" / "When:" labels
+    - No blank lines (matches your sample)
+    """
     headline = (details.get("headline") or "").strip()
-    what_lines = details.get("what_lines") or []
+    what_lines = [w.strip() for w in (details.get("what_lines") or []) if (w or "").strip()]
     when_line = (details.get("when_line") or "").strip()
     issued_short = (details.get("issued_short") or "").strip()
 
@@ -555,35 +561,29 @@ def build_fb_text(event_name: str, emoji: str, details: Dict[str, Any]) -> str:
         "Please check on neighbours who may need help staying warm or getting supplies."
     )
 
-    lines: List[str] = [header]
     if headline:
-        lines.append(headline)
+        h = headline[:-1] if headline.endswith(".") else headline
+        line1 = f"{emoji} - {h} in Tay Township."
+    else:
+        line1 = f"{emoji} - {event_name} in Tay Township."
 
-    chosen_what = [w for w in what_lines if w][:FB_WHAT_MAX]
-    if chosen_what:
-        lines.append("")
-        lines.extend(chosen_what)
+    lines: List[str] = [line1]
+
+    lines.extend(what_lines[:FB_WHAT_MAX])
 
     if when_line:
-        lines.append("")
-        lines.append(when_line.strip())
+        lines.append(when_line)
 
-    lines.append("")
     lines.append(care)
-    lines.append("")
     lines.append(f"More: {MORE_INFO_URL}")
+
     if issued_short:
         lines.append(issued_short)
-    lines.append(HASHTAGS)
 
-    cleaned: List[str] = []
-    for ln in lines:
-        ln = (ln or "").rstrip()
-        if ln == "" and (not cleaned or cleaned[-1] == ""):
-            continue
-        cleaned.append(ln)
-    return "\n".join(cleaned).strip()
+    if HASHTAGS:
+        lines.append(HASHTAGS)
 
+    return "\n".join([ln for ln in lines if ln]).strip()
 
 # ----------------------------
 # RSS helpers
