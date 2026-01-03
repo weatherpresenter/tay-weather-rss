@@ -630,37 +630,37 @@ def main() -> None:
                 safe_print(f"⚠️ X skipped: {e}")
 
 
-# FB post cooldown + spam block handling
-if ENABLE_FB_POSTING:
-    cooldown_until = state.get("fb_cooldown_until")
-    if cooldown_until and now_ts() < int(cooldown_until):
-        safe_print("⚠️ Facebook skipped: cooldown")
-    else:
-        last_fb = state.get("last_fb_post_ts")
-        if last_fb and (now_ts() - int(last_fb)) < FB_MIN_INTERVAL_SECONDS:
-            safe_print("⚠️ Facebook skipped: min interval")
+    # FB post cooldown + spam block handling
+    if ENABLE_FB_POSTING:
+        cooldown_until = state.get("fb_cooldown_until")
+        if cooldown_until and now_ts() < int(cooldown_until):
+            safe_print("⚠️ Facebook skipped: cooldown")
         else:
-            try:
-                ok, rate_limited = fb_post_message(fb_text)
-                if ok:
-                    state["last_fb_post_ts"] = now_ts()
-                    posted_any = True
-                elif rate_limited:
-                    # Code 368 / 1390008 spam protection — back off for 2 hours
-                    state["fb_cooldown_until"] = now_ts() + 2 * 60 * 60
-                    safe_print("⚠️ Facebook rate limit hit. Backing off for 2 hours.")
-            except Exception as e:
-                safe_print(f"⚠️ Facebook skipped: {e}")
-
-    # Mark alert as posted only if at least one platform succeeded
-    if posted_any:
-        state["last_alert_hash"] = alert_hash
-        save_state(state)
-        safe_print(f"Social posts sent: {'1+' if posted_any else '0'}")
-    else:
-        # Still save state hash? No — keep so it retries later when cooldown lifts
-        save_state(state)
-        safe_print("No social posts sent for this alert.")
+            last_fb = state.get("last_fb_post_ts")
+            if last_fb and (now_ts() - int(last_fb)) < FB_MIN_INTERVAL_SECONDS:
+                safe_print("⚠️ Facebook skipped: min interval")
+            else:
+                try:
+                    ok, rate_limited = fb_post_message(fb_text)
+                    if ok:
+                        state["last_fb_post_ts"] = now_ts()
+                        posted_any = True
+                    elif rate_limited:
+                        # Code 368 / 1390008 spam protection — back off for 2 hours
+                        state["fb_cooldown_until"] = now_ts() + 2 * 60 * 60
+                        safe_print("⚠️ Facebook rate limit hit. Backing off for 2 hours.")
+                except Exception as e:
+                    safe_print(f"⚠️ Facebook skipped: {e}")
+    
+        # Mark alert as posted only if at least one platform succeeded
+        if posted_any:
+            state["last_alert_hash"] = alert_hash
+            save_state(state)
+            safe_print(f"Social posts sent: {'1+' if posted_any else '0'}")
+        else:
+            # Still save state hash? No — keep so it retries later when cooldown lifts
+            save_state(state)
+            safe_print("No social posts sent for this alert.")
 
 if __name__ == "__main__":
     main()
